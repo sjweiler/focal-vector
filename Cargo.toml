@@ -1,0 +1,15 @@
+[package]
+name = "focal-vector"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "A low-latency vector search engine"
+
+[lib]
+name = "focal_vector"
+path = "src/lib.rs"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
