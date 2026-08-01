@@ -1,5 +1,5 @@
-use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BinaryHeap, HashSet};
 
 use crate::{Error, Metric, Result};
 
@@ -383,45 +383,43 @@ impl HnswIndex {
     }
 
     fn search_layer(&self, query: &[f32], entry: usize, ef: usize, layer: usize) -> Vec<usize> {
-        let mut visited = vec![false; self.nodes.len()];
-        visited[entry] = true;
-        let mut frontier = vec![entry];
-        let mut results = vec![entry];
+        let entry = HeapItem {
+            index: entry,
+            score: self.score(query, entry),
+        };
+        let mut visited = HashSet::with_capacity(ef.saturating_mul(self.config.m).min(65_536));
+        visited.insert(entry.index);
+        let mut frontier = BinaryHeap::from([entry]);
+        let mut results = BinaryHeap::from([Reverse(entry)]);
 
-        while !frontier.is_empty() {
-            let best_position = frontier
-                .iter()
-                .enumerate()
-                .min_by(|(_, left), (_, right)| self.compare_nodes(query, **left, **right))
-                .map(|(position, _)| position)
-                .expect("frontier is non-empty");
-            let candidate = frontier.swap_remove(best_position);
-            let worst_score = results
-                .last()
-                .map(|index| self.score(query, *index))
-                .unwrap_or(f32::NEG_INFINITY);
-            if results.len() >= ef && self.score(query, candidate) < worst_score {
+        while let Some(candidate) = frontier.pop() {
+            let worst = results.peek().expect("results are non-empty").0;
+            if results.len() >= ef && candidate < worst {
                 break;
             }
 
-            for &neighbor in self.neighbors(candidate, layer) {
-                if visited[neighbor] {
+            for &neighbor in self.neighbors(candidate.index, layer) {
+                if !visited.insert(neighbor) {
                     continue;
                 }
-                visited[neighbor] = true;
-                let qualifies = results.len() < ef
-                    || self.compare_nodes(query, neighbor, *results.last().expect("non-empty"))
-                        == Ordering::Less;
+                let item = HeapItem {
+                    index: neighbor,
+                    score: self.score(query, neighbor),
+                };
+                let qualifies =
+                    results.len() < ef || item > results.peek().expect("results are non-empty").0;
                 if qualifies {
-                    frontier.push(neighbor);
-                    results.push(neighbor);
-                    results
-                        .sort_unstable_by(|left, right| self.compare_nodes(query, *left, *right));
-                    results.truncate(ef);
+                    frontier.push(item);
+                    results.push(Reverse(item));
+                    if results.len() > ef {
+                        results.pop();
+                    }
                 }
             }
         }
-        results
+        let mut result: Vec<usize> = results.into_iter().map(|item| item.0.index).collect();
+        result.sort_unstable_by(|left, right| self.compare_nodes(query, *left, *right));
+        result
     }
 
     fn neighbors(&self, node: usize, layer: usize) -> &[usize] {
@@ -443,6 +441,34 @@ impl HnswIndex {
             self.score(query, right),
             &self.nodes[right].id,
         )
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HeapItem {
+    index: usize,
+    score: f32,
+}
+
+impl PartialEq for HeapItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.score.to_bits() == other.score.to_bits() && self.index == other.index
+    }
+}
+
+impl Eq for HeapItem {}
+
+impl PartialOrd for HeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HeapItem {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.score
+            .total_cmp(&other.score)
+            .then_with(|| other.index.cmp(&self.index))
     }
 }
 

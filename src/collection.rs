@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 
 use crate::{Error, Filter, Metric, Result, Value};
 
@@ -107,21 +107,13 @@ impl Collection {
             });
         }
         let query = self.config.metric.prepare(query)?;
-        let mut hits: Vec<SearchHit> = self
-            .points
-            .values()
-            .filter(|point| filter.is_none_or(|filter| filter.matches(&point.metadata)))
-            .map(|point| SearchHit {
-                id: point.id.clone(),
-                score: self.config.metric.score(&query, &point.vector),
-                metadata: point.metadata.clone(),
-                sequence: point.sequence,
-            })
-            .collect();
-
-        hits.sort_unstable_by(compare_hits);
-        hits.truncate(k);
-        Ok(hits)
+        Ok(self.top_k(
+            &query,
+            k,
+            self.points
+                .values()
+                .filter(|point| filter.is_none_or(|filter| filter.matches(&point.metadata))),
+        ))
     }
 
     fn next_sequence(&self) -> Result<u64> {
@@ -177,6 +169,64 @@ impl Collection {
         points
     }
 
+    pub(crate) fn search_ids(
+        &self,
+        query: Vec<f32>,
+        k: usize,
+        ids: &HashSet<String>,
+        filter: Option<&Filter>,
+    ) -> Result<Vec<SearchHit>> {
+        if k == 0 {
+            return Err(Error::InvalidQuery("k must be greater than zero"));
+        }
+        if query.len() != self.config.dimension {
+            return Err(Error::InvalidDimension {
+                expected: self.config.dimension,
+                actual: query.len(),
+            });
+        }
+        let query = self.config.metric.prepare(query)?;
+        Ok(self.top_k(
+            &query,
+            k,
+            ids.iter()
+                .filter_map(|id| self.points.get(id))
+                .filter(|point| filter.is_none_or(|filter| filter.matches(&point.metadata))),
+        ))
+    }
+
+    fn top_k<'a>(
+        &'a self,
+        query: &[f32],
+        k: usize,
+        points: impl Iterator<Item = &'a Point>,
+    ) -> Vec<SearchHit> {
+        let mut heap = BinaryHeap::with_capacity(k.saturating_add(1));
+        for point in points {
+            let ranked = RankedPoint {
+                point,
+                score: self.config.metric.score(query, &point.vector),
+            };
+            if heap.len() < k {
+                heap.push(ranked);
+            } else if heap.peek().is_some_and(|worst| ranked < *worst) {
+                heap.pop();
+                heap.push(ranked);
+            }
+        }
+        let mut ranked = heap.into_vec();
+        ranked.sort_unstable();
+        ranked
+            .into_iter()
+            .map(|ranked| SearchHit {
+                id: ranked.point.id.clone(),
+                score: ranked.score,
+                metadata: ranked.point.metadata.clone(),
+                sequence: ranked.point.sequence,
+            })
+            .collect()
+    }
+
     pub(crate) fn restore_snapshot(&mut self, points: Vec<Point>, sequence: u64) -> Result<()> {
         if points.iter().any(|point| point.sequence > sequence) {
             return Err(Error::CorruptStorage(
@@ -196,11 +246,33 @@ impl Collection {
     }
 }
 
-fn compare_hits(left: &SearchHit, right: &SearchHit) -> Ordering {
-    right
-        .score
-        .total_cmp(&left.score)
-        .then_with(|| left.id.cmp(&right.id))
+#[derive(Clone, Copy)]
+struct RankedPoint<'a> {
+    point: &'a Point,
+    score: f32,
+}
+
+impl PartialEq for RankedPoint<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.score.to_bits() == other.score.to_bits() && self.point.id == other.point.id
+    }
+}
+
+impl Eq for RankedPoint<'_> {}
+
+impl PartialOrd for RankedPoint<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RankedPoint<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .score
+            .total_cmp(&self.score)
+            .then_with(|| self.point.id.cmp(&other.point.id))
+    }
 }
 
 #[cfg(test)]

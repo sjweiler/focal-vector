@@ -10,6 +10,11 @@ pub enum Error {
     InvalidQuery(&'static str),
     Io(String),
     CorruptStorage(String),
+    Concurrency(String),
+    NotFound(String),
+    AlreadyExists(String),
+    Unauthorized,
+    ResourceExhausted(String),
     SequenceOverflow,
 }
 
@@ -27,6 +32,11 @@ impl Display for Error {
             Self::InvalidQuery(message) => write!(f, "invalid query: {message}"),
             Self::Io(message) => write!(f, "storage I/O error: {message}"),
             Self::CorruptStorage(message) => write!(f, "corrupt storage: {message}"),
+            Self::Concurrency(message) => write!(f, "concurrency error: {message}"),
+            Self::NotFound(message) => write!(f, "not found: {message}"),
+            Self::AlreadyExists(message) => write!(f, "already exists: {message}"),
+            Self::Unauthorized => f.write_str("unauthorized"),
+            Self::ResourceExhausted(message) => write!(f, "resource exhausted: {message}"),
             Self::SequenceOverflow => f.write_str("collection sequence overflow"),
         }
     }

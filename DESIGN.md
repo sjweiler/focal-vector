@@ -139,8 +139,9 @@ by collection policy to protect tail latency.
 The Rust HNSW implementation owns its graph representation and uses deterministic
 level selection and tie-breaking, making builds reproducible. The graph is
 versioned and persisted inside the checksummed immutable segment. Unfiltered
-queries use it after flush and restart; mutations safely invalidate it until the
-next flush. Filter-aware traversal is the next integration step.
+queries merge graph candidates with exact results from IDs changed since the
+last flush, preserving ANN performance during incremental writes. Filter-aware
+traversal is the next integration step.
 
 The mutable memtable uses exact search until it is large enough to justify a
 temporary HNSW index. A background builder may rebuild that graph in batches;
@@ -155,6 +156,11 @@ disk-oriented graphs only after profiling shows memory is the limiting factor.
 Keyword, boolean, and low-cardinality integer values use compressed bitmaps.
 Numeric and timestamp ranges use sorted value/posting blocks. The filter engine
 produces a segment-local candidate bitmap and an estimated cardinality.
+
+The current Rust engine implements equivalent in-memory posting sets for scalar
+equality and ordered numeric postings for ranges. Boolean combinations, negation,
+and dirty-point merging preserve filter correctness. Compressed persisted
+bitmaps remain a future memory and startup optimization.
 
 The planner chooses among:
 
@@ -221,6 +227,13 @@ request to destabilize the node.
 
 ## 9. Concurrency and consistency
 
+`ShardedCollection` implements static data partitioning with stable FNV-1a ID
+hashing. Writes are atomic within each shard after whole-request validation.
+Queries fan out concurrently and merge shard-local top-k results by descending
+score and ascending point ID. A multi-shard write is not a transaction: retry
+safety and node failure tolerance require the replicated-shard protocol in
+[`DISTRIBUTED.md`](DISTRIBUTED.md).
+
 Readers pin an immutable manifest generation and do not take collection-wide
 locks. Writers serialize sequence assignment and WAL append, then publish a new
 memtable view. Flush and compaction publish files through atomic manifest swaps.
@@ -242,6 +255,19 @@ then retires old files after their readers exit.
 
 Throttle compaction by bytes read/written and CPU time. Query latency takes
 priority; otherwise a large rebuild will create severe p99 spikes.
+
+Graph and segment construction now runs from a short read-locked snapshot and
+outside the collection lock. Publication takes a short write lock. WAL records
+that arrive during construction are retained and replayed over the new segment,
+and manifest sequence checks prevent stale builders from replacing newer work.
+
+## 10.1 Backup and restore
+
+Backups first publish a snapshot, then copy the checksummed collection metadata,
+manifest, immutable segment, and any concurrent WAL delta under a read lock.
+Files are synced into a temporary backup directory before an atomic rename.
+Restore copies into a new collection directory and validates the ordinary
+metadata, segment, graph, and WAL formats when the restored collection opens.
 
 ## 11. Scaling beyond one node
 

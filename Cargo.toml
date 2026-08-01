@@ -5,6 +5,16 @@ edition = "2024"
 license = "Apache-2.0"
 description = "A low-latency vector search engine"
 
+[dependencies]
+axum = "0.8.9"
+memmap2 = "0.9.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "~1.47.0", features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
 [lib]
 name = "focal_vector"
 path = "src/lib.rs"
@@ -12,4 +22,3 @@ path = "src/lib.rs"
 [profile.release]
 lto = "thin"
 codegen-units = 1
-

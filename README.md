@@ -2,8 +2,8 @@
 
 [![Rust](https://img.shields.io/badge/Rust-2024%20edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![Dependencies](https://img.shields.io/badge/Dependencies-0-brightgreen.svg)](Cargo.toml)
-[![Tests](https://img.shields.io/badge/Tests-20%20passing-brightgreen.svg)](#try-it)
+[![Dependencies](https://img.shields.io/badge/Runtime%20dependencies-5-brightgreen.svg)](Cargo.toml)
+[![Tests](https://img.shields.io/badge/Tests-39%20passing-brightgreen.svg)](#try-it)
 
 Focal Vector is a design for a low-latency, durable vector database. The first
 release is deliberately single-node: it optimizes the data path before adding
@@ -12,9 +12,13 @@ distributed coordination.
 The proposed architecture, data model, APIs, indexing strategy, and delivery
 plan are documented in [DESIGN.md](DESIGN.md).
 
-The implementation is in Rust. Its current first milestone is a dependency-free
-exact-search engine that defines the behavior later HNSW and persistent storage
-layers must match.
+The implementation is in Rust. It provides an exact-search correctness engine,
+persisted HNSW indexing, durable storage, concurrent access, and an HTTP service.
+
+The library also provides static hash sharding through `ShardedCollection`:
+point IDs route deterministically with FNV-1a, shard searches run concurrently,
+and shard-local results merge into a deterministic global top-k. Shard count is
+a storage contract; changing it requires an explicit data migration.
 
 Durable collections are backed by a versioned, CRC32C-protected write-ahead log.
 Synchronous commits are acknowledged only after `sync_data`, collection
@@ -33,12 +37,77 @@ the checksummed segment, and unfiltered persistent queries use it after restart.
 Exact search remains the reference engine and the path for metadata-filtered
 queries.
 
+Committed mutations are kept as a small exact-search delta and merged with HNSW
+results, so writes do not disable the immutable graph. The next flush folds that
+delta into a newly built graph.
+
+Immutable snapshots also carry in-memory equality and numeric-range indexes for
+metadata query planning. Compound filters search only matching snapshot IDs and
+merge them with filtered dirty points.
+
+Segment recovery uses a read-only memory map, avoiding a second whole-file input
+buffer while checksums and graph structures are decoded.
+
+Collection directories use operating-system exclusive file locks, preventing a
+second process or handle from opening the same collection for writing.
+
 ## Try it
 
 ```bash
 cargo test
 cargo clippy --all-targets -- -D warnings
+cargo run --release --bin focal-bench -- 10000 128 100 96
 ```
+
+## Run the server
+
+```bash
+FOCAL_DATA_DIR=./data \
+FOCAL_BIND=127.0.0.1:8080 \
+FOCAL_TOKEN=change-me \
+cargo run --release --bin focal-server
+```
+
+`FOCAL_TOKEN` is optional, but omitting it disables API authentication. The
+server binds to localhost by default. Health, readiness, and Prometheus metrics
+are public at `/healthz`, `/readyz`, and `/metrics`.
+
+```bash
+curl -X PUT http://127.0.0.1:8080/v1/collections/articles \
+  -H 'Authorization: Bearer change-me' \
+  -H 'Content-Type: application/json' \
+  -d '{"dimension":3,"metric":"cosine"}'
+
+curl -X POST http://127.0.0.1:8080/v1/collections/articles/points/upsert \
+  -H 'Authorization: Bearer change-me' \
+  -H 'Content-Type: application/json' \
+  -d '{"points":[{"id":"doc-1","vector":[0.2,0.4,0.8],"metadata":{"tenant":"acme"}}]}'
+
+curl -X POST http://127.0.0.1:8080/v1/collections/articles/query \
+  -H 'Authorization: Bearer change-me' \
+  -H 'Content-Type: application/json' \
+  -d '{"vector":[0.1,0.3,0.9],"k":10,"filter":{"op":"eq","field":"tenant","value":"acme"}}'
+```
+
+Request bodies, batch sizes, result counts, and filter nesting are bounded.
+Blocking storage work runs outside Tokio's asynchronous worker threads, and the
+server shuts down gracefully on Ctrl-C.
+
+Create and restore an atomic backup:
+
+```bash
+curl -X POST \
+  http://127.0.0.1:8080/v1/collections/articles/backups/articles-2026-07-31 \
+  -H 'Authorization: Bearer change-me'
+
+curl -X POST \
+  http://127.0.0.1:8080/v1/backups/articles-2026-07-31/restore/articles-restored \
+  -H 'Authorization: Bearer change-me'
+```
+
+Backups are written under `<data-dir>/.backups` through a synced temporary
+directory and atomic rename. They include the immutable segment and any WAL
+delta captured under a consistent collection read lock.
 
 ```rust
 use std::collections::BTreeMap;
@@ -90,6 +159,25 @@ let neighbors = index.search(vec![0.1, 0.3, 0.9], 10, 64)?;
 # Ok::<(), focal_vector::Error>(())
 ```
 
+For concurrent access and automatic checkpointing:
+
+```rust
+use std::time::Duration;
+use focal_vector::{CollectionConfig, Durability, Metric, SharedCollection};
+
+let vectors = SharedCollection::open(
+    "./data/articles",
+    CollectionConfig { dimension: 768, metric: Metric::Cosine },
+    Durability::Sync,
+)?;
+let flusher = vectors.start_background_flush(Duration::from_secs(1), 10_000)?;
+
+// Clone `vectors` into request workers. Dropping `flusher` stops and joins its
+// managed thread; `flusher.stop()` additionally reports background errors.
+# drop(flusher);
+# Ok::<(), focal_vector::Error>(())
+```
+
 ## Initial targets
 
 | Workload | Target |
@@ -109,6 +197,6 @@ Targets are hypotheses until measured on representative hardware and data.
 2. ~~WAL and recovery.~~
 3. ~~Mutable state flush and immutable segment files.~~
 4. ~~HNSW graph with tunable recall/latency and segment persistence.~~
-5. Metadata indexes and filtered-search planning.
-6. Background compaction, snapshots, and operational metrics.
+5. ~~Metadata equality/range indexes and filtered-search planning.~~
+6. ~~Background snapshot compaction and operational metrics.~~
 7. Replication and sharding only after the single-node SLO is repeatable.
