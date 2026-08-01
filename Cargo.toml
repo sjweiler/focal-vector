@@ -10,6 +10,7 @@ axum = "0.8.9"
 axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
 memmap2 = "0.9.11"
 openraft = { version = "=0.9.25", features = ["serde", "storage-v2"] }
+rayon = "1.11"
 reqwest = { version = "0.12.5", default-features = false, features = ["json", "rustls-tls"] }
 rustls = { version = "0.23.42", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pki-types = { version = "1.15.0", features = ["std"] }

@@ -10,6 +10,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dimension = argument(2, 128);
     let query_count = argument(3, 100);
     let ef_search = argument(4, 96);
+    let m = argument(5, HnswConfig::default().m);
+    let ef_construction = argument(6, HnswConfig::default().ef_construction);
+    let ef_search_values = ef_search_values(ef_search)?;
     let k = 10.min(point_count);
     if point_count == 0 || dimension == 0 || query_count == 0 {
         return Err("point count, dimension, and query count must be positive".into());
@@ -50,7 +53,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     let build_started = Instant::now();
-    let approximate = HnswIndex::build(dimension, Metric::Cosine, HnswConfig::default(), points)?;
+    let approximate = HnswIndex::build(
+        dimension,
+        Metric::Cosine,
+        HnswConfig { m, ef_construction },
+        points,
+    )?;
     let build_elapsed = build_started.elapsed();
 
     let exact_started = Instant::now();
@@ -64,27 +72,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect::<Result<_, _>>()?;
     let exact_elapsed = exact_started.elapsed();
 
-    let approximate_started = Instant::now();
-    let approximate_results: Vec<HashSet<String>> = queries
-        .into_iter()
-        .map(|query| {
-            approximate
-                .search(query, k, ef_search.max(k))
-                .map(|hits| hits.into_iter().map(|hit| hit.id).collect())
-        })
-        .collect::<Result<_, _>>()?;
-    let approximate_elapsed = approximate_started.elapsed();
-
-    let matches: usize = exact_results
-        .iter()
-        .zip(&approximate_results)
-        .map(|(expected, actual)| expected.iter().filter(|id| actual.contains(*id)).count())
-        .sum();
-    let recall = matches as f64 / (query_count * k) as f64;
-    black_box((&exact_results, &approximate_results));
-
     println!(
-        "points={point_count} dimensions={dimension} queries={query_count} k={k} ef_search={ef_search}"
+        "points={point_count} dimensions={dimension} queries={query_count} k={k} m={m} ef_construction={ef_construction}"
     );
     println!("hnsw_build_ms={:.2}", build_elapsed.as_secs_f64() * 1_000.0);
     println!(
@@ -92,12 +81,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         query_count as f64 / exact_elapsed.as_secs_f64(),
         exact_elapsed.as_secs_f64() * 1_000.0 / query_count as f64
     );
-    println!(
-        "hnsw_qps={:.1} hnsw_ms_per_query={:.3} recall_at_{k}={recall:.4}",
-        query_count as f64 / approximate_elapsed.as_secs_f64(),
-        approximate_elapsed.as_secs_f64() * 1_000.0 / query_count as f64
-    );
+    for ef_search in ef_search_values {
+        let approximate_started = Instant::now();
+        let approximate_results: Vec<HashSet<String>> = queries
+            .iter()
+            .map(|query| {
+                approximate
+                    .search(query.clone(), k, ef_search.max(k))
+                    .map(|hits| hits.into_iter().map(|hit| hit.id).collect())
+            })
+            .collect::<Result<_, _>>()?;
+        let approximate_elapsed = approximate_started.elapsed();
+        let matches: usize = exact_results
+            .iter()
+            .zip(&approximate_results)
+            .map(|(expected, actual)| expected.iter().filter(|id| actual.contains(*id)).count())
+            .sum();
+        let recall = matches as f64 / (query_count * k) as f64;
+        black_box(&approximate_results);
+        println!(
+            "ef_search={ef_search} hnsw_qps={:.1} hnsw_ms_per_query={:.3} recall_at_{k}={recall:.4}",
+            query_count as f64 / approximate_elapsed.as_secs_f64(),
+            approximate_elapsed.as_secs_f64() * 1_000.0 / query_count as f64
+        );
+    }
+    black_box(&exact_results);
     Ok(())
+}
+
+fn ef_search_values(default: usize) -> Result<Vec<usize>, Box<dyn std::error::Error>> {
+    let Some(values) = env::var_os("FOCAL_BENCH_EF_SWEEP") else {
+        return Ok(vec![default]);
+    };
+    let values = values
+        .to_str()
+        .ok_or("FOCAL_BENCH_EF_SWEEP must be valid UTF-8")?;
+    let parsed: Vec<usize> = values
+        .split(',')
+        .map(|value| value.trim().parse())
+        .collect::<Result<_, _>>()?;
+    if parsed.is_empty() || parsed.contains(&0) {
+        return Err("FOCAL_BENCH_EF_SWEEP must contain positive integers".into());
+    }
+    Ok(parsed)
 }
 
 fn argument(position: usize, default: usize) -> usize {

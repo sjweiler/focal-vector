@@ -37,19 +37,55 @@ impl Metric {
     /// Returns a score where larger values are always better.
     pub(crate) fn score(self, query: &[f32], candidate: &[f32]) -> f32 {
         match self {
-            Self::Cosine | Self::DotProduct => query
-                .iter()
-                .zip(candidate)
-                .map(|(left, right)| left * right)
-                .sum(),
-            Self::Euclidean => -query
-                .iter()
-                .zip(candidate)
-                .map(|(left, right)| {
-                    let delta = left - right;
-                    delta * delta
-                })
-                .sum::<f32>(),
+            Self::Cosine | Self::DotProduct => dot_product(query, candidate),
+            Self::Euclidean => -squared_distance(query, candidate),
         }
     }
+}
+
+// Multiple accumulators break the dependency chain in a scalar reduction and
+// give LLVM a shape it can vectorize without changing the public score type.
+fn dot_product(left: &[f32], right: &[f32]) -> f32 {
+    let mut sums = [0.0_f32; 4];
+    let mut left_chunks = left.chunks_exact(4);
+    let mut right_chunks = right.chunks_exact(4);
+    for (left, right) in left_chunks.by_ref().zip(right_chunks.by_ref()) {
+        sums[0] += left[0] * right[0];
+        sums[1] += left[1] * right[1];
+        sums[2] += left[2] * right[2];
+        sums[3] += left[3] * right[3];
+    }
+    sums.into_iter().sum::<f32>()
+        + left_chunks
+            .remainder()
+            .iter()
+            .zip(right_chunks.remainder())
+            .map(|(left, right)| left * right)
+            .sum::<f32>()
+}
+
+fn squared_distance(left: &[f32], right: &[f32]) -> f32 {
+    let mut sums = [0.0_f32; 4];
+    let mut left_chunks = left.chunks_exact(4);
+    let mut right_chunks = right.chunks_exact(4);
+    for (left, right) in left_chunks.by_ref().zip(right_chunks.by_ref()) {
+        let delta0 = left[0] - right[0];
+        let delta1 = left[1] - right[1];
+        let delta2 = left[2] - right[2];
+        let delta3 = left[3] - right[3];
+        sums[0] += delta0 * delta0;
+        sums[1] += delta1 * delta1;
+        sums[2] += delta2 * delta2;
+        sums[3] += delta3 * delta3;
+    }
+    sums.into_iter().sum::<f32>()
+        + left_chunks
+            .remainder()
+            .iter()
+            .zip(right_chunks.remainder())
+            .map(|(left, right)| {
+                let delta = left - right;
+                delta * delta
+            })
+            .sum::<f32>()
 }

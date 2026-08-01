@@ -68,6 +68,52 @@ cargo clippy --all-targets -- -D warnings
 cargo run --release --bin focal-bench -- 10000 128 100 96
 ```
 
+The benchmark arguments are `points dimensions queries ef_search m
+ef_construction`. HNSW construction automatically uses the Rayon CPU pool;
+set `RAYON_NUM_THREADS` to override its detected core count. A single build can
+measure a recall/latency curve without rebuilding the graph:
+
+```bash
+FOCAL_BENCH_EF_SWEEP=96,192,384,768 \
+cargo run --release --bin focal-bench -- 1000000 128 100 96 32 400
+```
+
+### HNSW construction and tuning
+
+The builder stores all vectors in one contiguous `f32` arena and constructs the
+graph in deterministic batches. It builds a 4,096-point seed graph serially,
+plans groups of 512 insertions in parallel against a stable graph snapshot, and
+then applies those plans in input order. Each Rayon worker reuses generation-
+marked visitation storage, avoiding a hash table allocation for every insertion.
+Neighbor selection uses the HNSW diversity heuristic, with `2 * M` connections
+on the base layer and `M` above it. The persisted graph format remains compatible
+with graphs written before the contiguous in-memory layout was introduced.
+
+The following results were measured with 32 visible CPU cores on the benchmark's
+deterministic one-million-vector, 128-dimensional cosine corpus. Times are means
+over 100 queries; these synthetic results are useful for regression testing but
+must not replace recall and percentile measurements on production embeddings.
+
+| Profile | Build time | `ef_search` | Recall@10 | Mean query latency |
+|---|---:|---:|---:|---:|
+| Fast build (`M=16`, `ef_construction=200`) | 153.4 s | 96 | 63.1% | 0.433 ms |
+| Fast build (`M=16`, `ef_construction=200`) | 153.4 s | 1536 | 85.7% | 5.357 ms |
+| High recall (`M=32`, `ef_construction=400`) | 501.6 s | 96 | 91.8% | 0.699 ms |
+| High recall (`M=32`, `ef_construction=400`) | 501.6 s | 384 | 96.0% | 2.430 ms |
+| High recall (`M=32`, `ef_construction=400`) | 501.6 s | 768 | 97.7% | 4.827 ms |
+
+Use `M=32`, `ef_construction=400`, and `ef_search=384` as the starting profile
+when recall matters at one million vectors. The default `M=16` profile favors
+build time and memory; increasing only `ef_search` cannot recover recall that
+was lost during graph construction. Larger `M` also increases resident graph
+memory and full rebuild time.
+
+GPU indexing is not implemented in Focal Vector. At this scale, one million
+128-dimensional `f32` vectors occupy about 488 MiB, so deployments with a CUDA
+GPU should separately benchmark exact GPU search or a GPU-native graph index
+before committing to CPU HNSW. The CPU implementation remains useful when a GPU
+dependency is undesirable or the index must be served from ordinary hosts.
+
 ## Run the server
 
 ```bash

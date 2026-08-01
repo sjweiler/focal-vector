@@ -137,8 +137,18 @@ memory and build cost. `ef_search` is a per-query control and should be bounded
 by collection policy to protect tail latency.
 
 The Rust HNSW implementation owns its graph representation and uses deterministic
-level selection and tie-breaking, making builds reproducible. The graph is
-versioned and persisted inside the checksummed immutable segment. Unfiltered
+level selection and tie-breaking, making builds reproducible. Vectors occupy a
+contiguous `f32` arena rather than one allocation per node. Construction creates
+a serial seed and then plans fixed-size insertion batches in parallel against a
+stable graph snapshot; plans are applied in input order so results do not depend
+on Rayon scheduling or worker count. Per-worker generation marks replace
+per-insertion visited hash sets. The base layer permits `2 * M` neighbors and
+selection applies the HNSW diversity heuristic before bounded batch pruning.
+
+The graph is
+versioned and persisted inside the checksummed immutable segment. The serialized
+node/vector ordering is unchanged by the contiguous in-memory representation.
+Unfiltered
 queries merge graph candidates with exact results from IDs changed since the
 last flush, preserving ANN performance during incremental writes. Replicated
 shards adaptively expand HNSW traversal for broad filters and fall back to exact

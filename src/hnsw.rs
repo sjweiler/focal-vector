@@ -1,15 +1,22 @@
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashSet};
 
+use rayon::prelude::*;
+
 use crate::{Error, Metric, Result};
 
 const MAX_LEVEL: usize = 32;
+const PARALLEL_BUILD_SEED: usize = 4_096;
+const PARALLEL_BUILD_BATCH: usize = 512;
 const GRAPH_MAGIC: &[u8; 4] = b"FVHG";
 const GRAPH_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HnswConfig {
+    /// Maximum degree above the base layer. The base layer uses `2 * m`, as
+    /// recommended by the HNSW construction algorithm.
     pub m: usize,
+    /// Candidate-list width used while inserting each point.
     pub ef_construction: usize,
 }
 
@@ -32,8 +39,17 @@ pub struct HnswHit {
 #[derive(Debug, Clone)]
 struct Node {
     id: String,
-    vector: Vec<f32>,
     neighbors: Vec<Vec<usize>>,
+}
+
+struct PreparedPoint {
+    id: String,
+    vector: Vec<f32>,
+    level: usize,
+}
+
+struct InsertionPlan {
+    neighbors: Vec<Vec<HeapItem>>,
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +58,7 @@ pub struct HnswIndex {
     metric: Metric,
     config: HnswConfig,
     nodes: Vec<Node>,
+    vectors: Vec<f32>,
     entry_point: Option<usize>,
     max_level: usize,
 }
@@ -52,24 +69,76 @@ impl HnswIndex {
         I: IntoIterator<Item = (String, Vec<f32>)>,
     {
         validate_config(dimension, config)?;
+        let points: Vec<_> = points.into_iter().collect();
+        let capacity = points.len();
+        let mut ids = HashSet::with_capacity(capacity);
+        for (id, _) in &points {
+            if id.is_empty() {
+                return Err(Error::InvalidQuery("point ID must not be empty"));
+            }
+            if !ids.insert(id.as_str()) {
+                return Err(Error::InvalidQuery("HNSW point IDs must be unique"));
+            }
+        }
+        drop(ids);
+        let prepared: Vec<PreparedPoint> = points
+            .into_par_iter()
+            .map(|(id, vector)| {
+                if vector.len() != dimension {
+                    return Err(Error::InvalidDimension {
+                        expected: dimension,
+                        actual: vector.len(),
+                    });
+                }
+                let vector = metric.prepare(vector)?;
+                Ok(PreparedPoint {
+                    level: deterministic_level(&id, config.m),
+                    id,
+                    vector,
+                })
+            })
+            .collect::<Result<_>>()?;
         let mut index = Self {
             dimension,
             metric,
             config,
-            nodes: Vec::new(),
+            nodes: Vec::with_capacity(capacity),
+            vectors: Vec::with_capacity(capacity.saturating_mul(dimension)),
             entry_point: None,
             max_level: 0,
         };
-        let mut ids = HashSet::new();
-        for (id, vector) in points {
-            if id.is_empty() {
-                return Err(Error::InvalidQuery("point ID must not be empty"));
-            }
-            if !ids.insert(id.clone()) {
-                return Err(Error::InvalidQuery("HNSW point IDs must be unique"));
-            }
-            index.insert(id, vector)?;
+        let mut workspace = BuildWorkspace::with_capacity(capacity);
+        let mut prepared = prepared.into_iter();
+        for point in prepared.by_ref().take(PARALLEL_BUILD_SEED) {
+            index.insert_prepared(point, &mut workspace);
         }
+
+        let worker_count = rayon::current_num_threads();
+        let mut workspaces: Vec<BuildWorkspace> = (0..worker_count)
+            .map(|_| BuildWorkspace::with_capacity(capacity))
+            .collect();
+        loop {
+            let batch: Vec<_> = prepared.by_ref().take(PARALLEL_BUILD_BATCH).collect();
+            if batch.is_empty() {
+                break;
+            }
+            let chunk_size = batch.len().div_ceil(worker_count);
+            let mut plans: Vec<Option<InsertionPlan>> =
+                std::iter::repeat_with(|| None).take(batch.len()).collect();
+            plans
+                .par_chunks_mut(chunk_size)
+                .zip(batch.par_chunks(chunk_size))
+                .zip(workspaces.par_iter_mut())
+                .for_each(|((plans, points), workspace)| {
+                    for (plan, point) in plans.iter_mut().zip(points) {
+                        *plan = Some(index.plan_insert(point, workspace));
+                    }
+                });
+            for (point, plan) in batch.into_iter().zip(plans) {
+                index.apply_insertion(point, plan.expect("every insertion was planned"));
+            }
+        }
+        index.compact_neighbors();
         Ok(index)
     }
 
@@ -122,9 +191,9 @@ impl HnswIndex {
         candidates.truncate(k);
         Ok(candidates
             .into_iter()
-            .map(|index| HnswHit {
-                id: self.nodes[index].id.clone(),
-                score: self.score(&query, index),
+            .map(|item| HnswHit {
+                id: self.nodes[item.index].id.clone(),
+                score: item.score,
             })
             .collect())
     }
@@ -146,9 +215,9 @@ impl HnswIndex {
                 .to_le_bytes(),
         );
         put_u32(&mut output, self.max_level)?;
-        for node in &self.nodes {
+        for (node_index, node) in self.nodes.iter().enumerate() {
             put_bytes(&mut output, node.id.as_bytes())?;
-            for value in &node.vector {
+            for value in self.vector(node_index) {
                 output.extend_from_slice(&value.to_le_bytes());
             }
             put_u32(&mut output, node.neighbors.len())?;
@@ -198,6 +267,10 @@ impl HnswIndex {
         }
 
         let mut nodes = Vec::with_capacity(node_count);
+        let vector_capacity = node_count.checked_mul(dimension).ok_or_else(|| {
+            Error::CorruptStorage("HNSW vector storage size overflows address space".into())
+        })?;
+        let mut vectors = Vec::with_capacity(vector_capacity);
         let mut ids = HashSet::with_capacity(node_count);
         for _ in 0..node_count {
             let id = decoder.string()?;
@@ -206,7 +279,6 @@ impl HnswIndex {
                     "HNSW graph contains an empty or duplicate ID".into(),
                 ));
             }
-            let mut vector = Vec::with_capacity(dimension);
             for _ in 0..dimension {
                 let value = decoder.f32()?;
                 if !value.is_finite() {
@@ -214,7 +286,7 @@ impl HnswIndex {
                         "HNSW graph contains a non-finite vector".into(),
                     ));
                 }
-                vector.push(value);
+                vectors.push(value);
             }
             let layer_count = decoder.usize()?;
             if layer_count == 0 || layer_count > MAX_LEVEL + 1 {
@@ -225,9 +297,9 @@ impl HnswIndex {
             let mut neighbors = Vec::with_capacity(layer_count);
             for _ in 0..layer_count {
                 let count = decoder.usize()?;
-                if count > config.m {
+                if count > max_connections(config, neighbors.len()) {
                     return Err(Error::CorruptStorage(
-                        "HNSW neighbor list exceeds configured m".into(),
+                        "HNSW neighbor list exceeds its configured layer limit".into(),
                     ));
                 }
                 let mut layer = Vec::with_capacity(count);
@@ -236,11 +308,7 @@ impl HnswIndex {
                 }
                 neighbors.push(layer);
             }
-            nodes.push(Node {
-                id,
-                vector,
-                neighbors,
-            });
+            nodes.push(Node { id, neighbors });
         }
         decoder.finish()?;
 
@@ -276,52 +344,81 @@ impl HnswIndex {
             metric,
             config,
             nodes,
+            vectors,
             entry_point,
             max_level,
         })
     }
 
-    fn insert(&mut self, id: String, vector: Vec<f32>) -> Result<()> {
-        if vector.len() != self.dimension {
-            return Err(Error::InvalidDimension {
-                expected: self.dimension,
-                actual: vector.len(),
-            });
+    fn insert_prepared(&mut self, point: PreparedPoint, workspace: &mut BuildWorkspace) {
+        if self.entry_point.is_none() {
+            let level = point.level;
+            self.apply_insertion(
+                point,
+                InsertionPlan {
+                    neighbors: vec![Vec::new(); level + 1],
+                },
+            );
+            return;
         }
-        let vector = self.metric.prepare(vector)?;
-        let level = deterministic_level(&id, self.config.m);
-        let new_index = self.nodes.len();
-        self.nodes.push(Node {
-            id,
-            vector,
-            neighbors: vec![Vec::new(); level + 1],
-        });
+        let plan = self.plan_insert(&point, workspace);
+        self.apply_insertion(point, plan);
+    }
 
-        let Some(mut current) = self.entry_point else {
-            self.entry_point = Some(new_index);
-            self.max_level = level;
-            return Ok(());
-        };
-
+    fn plan_insert(&self, point: &PreparedPoint, workspace: &mut BuildWorkspace) -> InsertionPlan {
+        let level = point.level;
+        let mut current = self
+            .entry_point
+            .expect("non-empty graph has an entry point");
         if self.max_level > level {
             for layer in ((level + 1)..=self.max_level).rev() {
-                current = self.greedy_closest(&self.nodes[new_index].vector, current, layer);
+                current = self.greedy_closest(&point.vector, current, layer);
             }
         }
 
-        for layer in (0..=level.min(self.max_level)).rev() {
-            let candidates = self.search_layer(
-                &self.nodes[new_index].vector,
+        let connected_levels = level.min(self.max_level);
+        let mut neighbors = vec![Vec::new(); level + 1];
+        for layer in (0..=connected_levels).rev() {
+            let candidates = self.search_layer_for_build(
+                &point.vector,
                 current,
                 self.config.ef_construction,
                 layer,
+                workspace,
             );
-            let selected: Vec<usize> = candidates.into_iter().take(self.config.m).collect();
-            if let Some(&closest) = selected.first() {
-                current = closest;
+            let selected = self.select_neighbors(candidates, max_connections(self.config, layer));
+            if let Some(closest) = selected.first() {
+                current = closest.index;
             }
+            neighbors[layer] = selected;
+        }
+        InsertionPlan { neighbors }
+    }
+
+    fn apply_insertion(&mut self, point: PreparedPoint, plan: InsertionPlan) {
+        let PreparedPoint { id, vector, level } = point;
+        let new_index = self.nodes.len();
+        self.vectors.extend_from_slice(&vector);
+        self.nodes.push(Node {
+            id,
+            neighbors: vec![Vec::new(); level + 1],
+        });
+
+        if self.entry_point.is_none() {
+            self.entry_point = Some(new_index);
+            self.max_level = level;
+            return;
+        }
+
+        for (layer, selected) in plan.neighbors.into_iter().enumerate() {
+            self.nodes[new_index].neighbors[layer].extend(selected.iter().map(|item| item.index));
             for neighbor in selected {
-                self.connect(new_index, neighbor, layer);
+                self.nodes[neighbor.index].neighbors[layer].push(new_index);
+                if self.nodes[neighbor.index].neighbors[layer].len()
+                    >= max_connections(self.config, layer).saturating_mul(2)
+                {
+                    self.prune(neighbor.index, layer);
+                }
             }
         }
 
@@ -329,32 +426,34 @@ impl HnswIndex {
             self.entry_point = Some(new_index);
             self.max_level = level;
         }
-        Ok(())
     }
 
-    fn connect(&mut self, left: usize, right: usize, layer: usize) {
-        self.nodes[left].neighbors[layer].push(right);
-        self.nodes[right].neighbors[layer].push(left);
-        self.prune(left, layer);
-        self.prune(right, layer);
+    fn compact_neighbors(&mut self) {
+        for node in 0..self.nodes.len() {
+            for layer in 0..self.nodes[node].neighbors.len() {
+                self.prune(node, layer);
+            }
+        }
     }
 
     fn prune(&mut self, node: usize, layer: usize) {
-        if self.nodes[node].neighbors[layer].len() <= self.config.m {
+        let limit = max_connections(self.config, layer);
+        if self.nodes[node].neighbors[layer].len() <= limit {
             return;
         }
-        let vector = self.nodes[node].vector.clone();
-        let mut neighbors = self.nodes[node].neighbors[layer].clone();
-        neighbors.sort_unstable_by(|left, right| {
-            compare_scored(
-                self.metric.score(&vector, &self.nodes[*left].vector),
-                &self.nodes[*left].id,
-                self.metric.score(&vector, &self.nodes[*right].vector),
-                &self.nodes[*right].id,
-            )
-        });
-        neighbors.truncate(self.config.m);
-        self.nodes[node].neighbors[layer] = neighbors;
+        let mut candidates: Vec<HeapItem> = self.nodes[node].neighbors[layer]
+            .iter()
+            .map(|&index| HeapItem {
+                index,
+                score: self.metric.score(self.vector(node), self.vector(index)),
+            })
+            .collect();
+        self.sort_items(&mut candidates);
+        self.nodes[node].neighbors[layer] = self
+            .select_neighbors(candidates, limit)
+            .into_iter()
+            .map(|item| item.index)
+            .collect();
     }
 
     fn greedy_closest(&self, query: &[f32], start: usize, layer: usize) -> usize {
@@ -382,7 +481,7 @@ impl HnswIndex {
         }
     }
 
-    fn search_layer(&self, query: &[f32], entry: usize, ef: usize, layer: usize) -> Vec<usize> {
+    fn search_layer(&self, query: &[f32], entry: usize, ef: usize, layer: usize) -> Vec<HeapItem> {
         let entry = HeapItem {
             index: entry,
             score: self.score(query, entry),
@@ -417,9 +516,89 @@ impl HnswIndex {
                 }
             }
         }
-        let mut result: Vec<usize> = results.into_iter().map(|item| item.0.index).collect();
-        result.sort_unstable_by(|left, right| self.compare_nodes(query, *left, *right));
+        let mut result: Vec<HeapItem> = results.into_iter().map(|item| item.0).collect();
+        self.sort_items(&mut result);
         result
+    }
+
+    fn search_layer_for_build(
+        &self,
+        query: &[f32],
+        entry: usize,
+        ef: usize,
+        layer: usize,
+        workspace: &mut BuildWorkspace,
+    ) -> Vec<HeapItem> {
+        workspace.begin(self.nodes.len());
+        let entry = HeapItem {
+            index: entry,
+            score: self.score(query, entry),
+        };
+        workspace.visit(entry.index);
+        let mut frontier = BinaryHeap::from([entry]);
+        let mut results = BinaryHeap::from([Reverse(entry)]);
+
+        while let Some(candidate) = frontier.pop() {
+            let worst = results.peek().expect("results are non-empty").0;
+            if results.len() >= ef && candidate < worst {
+                break;
+            }
+            for &neighbor in self.neighbors(candidate.index, layer) {
+                if !workspace.visit(neighbor) {
+                    continue;
+                }
+                let item = HeapItem {
+                    index: neighbor,
+                    score: self.score(query, neighbor),
+                };
+                if results.len() < ef || item > results.peek().expect("results are non-empty").0 {
+                    frontier.push(item);
+                    results.push(Reverse(item));
+                    if results.len() > ef {
+                        results.pop();
+                    }
+                }
+            }
+        }
+        let mut result: Vec<HeapItem> = results.into_iter().map(|item| item.0).collect();
+        self.sort_items(&mut result);
+        result
+    }
+
+    /// HNSW's diversity heuristic avoids filling every adjacency list with a
+    /// tight cluster of near-duplicates. Rejected candidates are used as a
+    /// fallback so sparse or highly clustered data still reaches `limit`.
+    fn select_neighbors(&self, candidates: Vec<HeapItem>, limit: usize) -> Vec<HeapItem> {
+        let mut selected = Vec::with_capacity(limit);
+        let mut rejected = Vec::new();
+        for candidate in candidates {
+            if selected.len() == limit {
+                break;
+            }
+            let diverse = selected.iter().all(|other: &HeapItem| {
+                self.metric
+                    .score(self.vector(candidate.index), self.vector(other.index))
+                    < candidate.score
+            });
+            if diverse {
+                selected.push(candidate);
+            } else {
+                rejected.push(candidate);
+            }
+        }
+        selected.extend(rejected.into_iter().take(limit - selected.len()));
+        selected
+    }
+
+    fn sort_items(&self, items: &mut [HeapItem]) {
+        items.sort_unstable_by(|left, right| {
+            compare_scored(
+                left.score,
+                &self.nodes[left.index].id,
+                right.score,
+                &self.nodes[right.index].id,
+            )
+        });
     }
 
     fn neighbors(&self, node: usize, layer: usize) -> &[usize] {
@@ -431,16 +610,45 @@ impl HnswIndex {
     }
 
     fn score(&self, query: &[f32], node: usize) -> f32 {
-        self.metric.score(query, &self.nodes[node].vector)
+        self.metric.score(query, self.vector(node))
     }
 
-    fn compare_nodes(&self, query: &[f32], left: usize, right: usize) -> Ordering {
-        compare_scored(
-            self.score(query, left),
-            &self.nodes[left].id,
-            self.score(query, right),
-            &self.nodes[right].id,
-        )
+    fn vector(&self, node: usize) -> &[f32] {
+        let start = node * self.dimension;
+        &self.vectors[start..start + self.dimension]
+    }
+}
+
+struct BuildWorkspace {
+    visited: Vec<u32>,
+    generation: u32,
+}
+
+impl BuildWorkspace {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            visited: Vec::with_capacity(capacity),
+            generation: 0,
+        }
+    }
+
+    fn begin(&mut self, node_count: usize) {
+        self.visited.resize(node_count, 0);
+        if self.generation == u32::MAX {
+            self.visited.fill(0);
+            self.generation = 1;
+        } else {
+            self.generation += 1;
+        }
+    }
+
+    fn visit(&mut self, node: usize) -> bool {
+        if self.visited[node] == self.generation {
+            false
+        } else {
+            self.visited[node] = self.generation;
+            true
+        }
     }
 }
 
@@ -491,6 +699,14 @@ fn validate_config(dimension: usize, config: HnswConfig) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn max_connections(config: HnswConfig, layer: usize) -> usize {
+    if layer == 0 {
+        config.m.saturating_mul(2)
+    } else {
+        config.m
+    }
 }
 
 fn deterministic_level(id: &str, m: usize) -> usize {
@@ -714,6 +930,24 @@ mod tests {
         let second = build().search(vec![1.0, 0.0], 2, 16).unwrap();
         assert_eq!(first, second);
         assert_eq!(first[0].id, "a");
+    }
+
+    #[test]
+    fn parallel_batches_are_deterministic() {
+        let points = points(PARALLEL_BUILD_SEED + 128);
+        let build = || {
+            HnswIndex::build(
+                3,
+                Metric::Cosine,
+                HnswConfig {
+                    m: 8,
+                    ef_construction: 32,
+                },
+                points.clone(),
+            )
+            .unwrap()
+        };
+        assert_eq!(build().encode().unwrap(), build().encode().unwrap());
     }
 
     #[test]
