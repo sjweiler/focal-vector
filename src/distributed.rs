@@ -191,7 +191,12 @@ impl DistributedCollection {
     {
         let mut failures = BTreeMap::new();
         for address in &self.shards[shard].addresses {
-            let url = format!("http://{address}{path}");
+            let base = if address.starts_with("http://") || address.starts_with("https://") {
+                address.trim_end_matches('/').to_owned()
+            } else {
+                format!("http://{}", address.trim_end_matches('/'))
+            };
+            let url = format!("{base}{path}");
             match self
                 .client
                 .post(&url)

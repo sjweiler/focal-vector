@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use axum::extract::{DefaultBodyLimit, Path as AxumPath, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use openraft::error::{
     InstallSnapshotError, NetworkError, RPCError, RaftError, RemoteError, Unreachable,
@@ -18,6 +18,7 @@ use openraft::raft::{
 use openraft::{BasicNode, Config, Raft};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 
 use crate::{
     CollectionConfig, DurableRaftLog, DurableShardStateMachine, Error, Filter, FocalRaftConfig,
@@ -27,11 +28,15 @@ use crate::{
 pub type FocalRaft = Raft<FocalRaftConfig>;
 type StandardRpcError = RPCError<NodeId, BasicNode, RaftError<NodeId>>;
 type SnapshotRpcError = RPCError<NodeId, BasicNode, RaftError<NodeId, InstallSnapshotError>>;
+const MAX_CLIENT_BODY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_IN_FLIGHT_CLIENT_OPERATIONS: usize = 256;
 
 #[derive(Clone)]
 pub struct HttpRaftNetwork {
     client: reqwest::Client,
     token: Arc<str>,
+    admission: Arc<Semaphore>,
+    blocked: Arc<RwLock<BTreeSet<NodeId>>>,
 }
 
 impl HttpRaftNetwork {
@@ -46,7 +51,22 @@ impl HttpRaftNetwork {
         Ok(Self {
             client,
             token: Arc::from(token),
+            admission: Arc::new(Semaphore::new(MAX_IN_FLIGHT_CLIENT_OPERATIONS)),
+            blocked: Arc::new(RwLock::new(BTreeSet::new())),
         })
+    }
+
+    pub fn set_blocked(&self, target: NodeId, blocked: bool) -> Result<()> {
+        let mut targets = self
+            .blocked
+            .write()
+            .map_err(|_| Error::Concurrency("Raft network fault lock is poisoned".into()))?;
+        if blocked {
+            targets.insert(target);
+        } else {
+            targets.remove(&target);
+        }
+        Ok(())
     }
 
     async fn send<Req, Resp, Remote>(
@@ -61,7 +81,27 @@ impl HttpRaftNetwork {
         Resp: DeserializeOwned,
         Remote: std::error::Error + DeserializeOwned,
     {
-        let url = format!("http://{}{}", node.addr, path);
+        if self
+            .blocked
+            .read()
+            .map_err(|_| {
+                let error = std::io::Error::other("Raft network fault lock is poisoned");
+                RPCError::Network(NetworkError::new(&error))
+            })?
+            .contains(&target)
+        {
+            let error = std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                format!("peer {target} is blocked by fault injection"),
+            );
+            return Err(RPCError::Unreachable(Unreachable::new(&error)));
+        }
+        let base = if node.addr.starts_with("http://") || node.addr.starts_with("https://") {
+            node.addr.trim_end_matches('/').to_owned()
+        } else {
+            format!("http://{}", node.addr.trim_end_matches('/'))
+        };
+        let url = format!("{base}{path}");
         let response = self
             .client
             .post(url)
@@ -143,6 +183,7 @@ pub struct RaftNode {
     id: NodeId,
     raft: FocalRaft,
     state_machine: DurableShardStateMachine,
+    network: HttpRaftNetwork,
     token: Arc<str>,
 }
 
@@ -165,13 +206,20 @@ impl RaftNode {
                 .validate()
                 .map_err(|error| Error::InvalidConfiguration(error.to_string()))?,
         );
-        let raft = Raft::new(id, config, network, log_store, state_machine.clone())
-            .await
-            .map_err(|error| Error::Concurrency(error.to_string()))?;
+        let raft = Raft::new(
+            id,
+            config,
+            network.clone(),
+            log_store,
+            state_machine.clone(),
+        )
+        .await
+        .map_err(|error| Error::Concurrency(error.to_string()))?;
         Ok(Self {
             id,
             raft,
             state_machine,
+            network,
             token: Arc::from(token),
         })
     }
@@ -184,6 +232,10 @@ impl RaftNode {
         &self.raft
     }
 
+    pub fn set_peer_blocked(&self, target: NodeId, blocked: bool) -> Result<()> {
+        self.network.set_blocked(target, blocked)
+    }
+
     pub async fn initialize(&self, members: BTreeMap<NodeId, BasicNode>) -> Result<()> {
         self.raft
             .initialize(members)
@@ -192,6 +244,10 @@ impl RaftNode {
     }
 
     pub async fn write(&self, command: ShardCommand) -> Result<ShardResponse> {
+        let _permit =
+            self.network.admission.try_acquire().map_err(|_| {
+                Error::ResourceExhausted("Raft client operation limit reached".into())
+            })?;
         self.raft
             .client_write(command)
             .await
@@ -221,6 +277,10 @@ impl RaftNode {
         k: usize,
         filter: Option<&Filter>,
     ) -> Result<Vec<SearchHit>> {
+        let _permit =
+            self.network.admission.try_acquire().map_err(|_| {
+                Error::ResourceExhausted("Raft client operation limit reached".into())
+            })?;
         self.raft
             .ensure_linearizable()
             .await
@@ -258,17 +318,22 @@ fn persist_node_id(directory: &Path, id: NodeId) -> Result<()> {
 }
 
 pub fn raft_router(node: Arc<RaftNode>) -> Router {
-    Router::new()
+    let internal = Router::new()
         .route("/internal/raft/vote", post(vote))
         .route("/internal/raft/append", post(append))
         .route("/internal/raft/snapshot", post(snapshot))
+        .layer(DefaultBodyLimit::max(512 * 1024 * 1024));
+    let client = Router::new()
         .route("/v1/raft/initialize", post(initialize_cluster))
         .route("/v1/raft/write", post(client_write))
         .route("/v1/raft/query", post(linearizable_query))
         .route("/v1/raft/learners/{id}", post(add_learner))
         .route("/v1/raft/membership", post(change_membership))
-        .layer(DefaultBodyLimit::max(512 * 1024 * 1024))
-        .with_state(node)
+        .route("/v1/raft/status", get(raft_status))
+        .route("/healthz", get(health))
+        .route("/readyz", get(ready))
+        .layer(DefaultBodyLimit::max(MAX_CLIENT_BODY_BYTES));
+    internal.merge(client).with_state(node)
 }
 
 #[derive(Debug, Deserialize)]
@@ -389,6 +454,28 @@ async fn change_membership(
         .await
         .map_err(api_error)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn raft_status(
+    State(node): State<Arc<RaftNode>>,
+    headers: HeaderMap,
+) -> std::result::Result<Json<openraft::RaftMetrics<NodeId, BasicNode>>, ApiFailure> {
+    if !authorized(&headers, &node.token) {
+        return Err(unauthorized());
+    }
+    Ok(Json(node.raft.metrics().borrow().clone()))
+}
+
+async fn health() -> StatusCode {
+    StatusCode::OK
+}
+
+async fn ready(State(node): State<Arc<RaftNode>>) -> StatusCode {
+    if node.raft.metrics().borrow().running_state.is_ok() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
 }
 
 fn authorized(headers: &HeaderMap, token: &str) -> bool {
@@ -603,6 +690,56 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
 
+        nodes[0].set_peer_blocked(2, true).unwrap();
+        nodes[0].set_peer_blocked(3, true).unwrap();
+        nodes[1].set_peer_blocked(1, true).unwrap();
+        nodes[2].set_peer_blocked(1, true).unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        let response = loop {
+            let command = || ShardCommand::Upsert {
+                client_id: "client".into(),
+                request_id: 10,
+                points: vec![UpsertPoint {
+                    id: "during-partition".into(),
+                    vector: vec![2.0, 0.0],
+                    metadata: BTreeMap::new(),
+                }],
+            };
+            if let Ok(response) = nodes[1].write(command()).await {
+                break response;
+            }
+            if let Ok(response) = nodes[2].write(command()).await {
+                break response;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "majority partition did not elect a leader"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert_eq!(response, ShardResponse::Applied { sequence: 2 });
+
+        let isolated_write = tokio::time::timeout(
+            Duration::from_secs(1),
+            nodes[0].write(ShardCommand::Upsert {
+                client_id: "isolated-client".into(),
+                request_id: 1,
+                points: vec![UpsertPoint {
+                    id: "must-not-ack".into(),
+                    vector: vec![9.0, 9.0],
+                    metadata: BTreeMap::new(),
+                }],
+            }),
+        )
+        .await;
+        assert!(
+            !matches!(isolated_write, Ok(Ok(_))),
+            "isolated leader acknowledged a write without quorum"
+        );
+        nodes[1].set_peer_blocked(1, false).unwrap();
+        nodes[2].set_peer_blocked(1, false).unwrap();
+
         nodes[0].raft.shutdown().await.unwrap();
         servers[0].abort();
 
@@ -610,7 +747,7 @@ mod tests {
         let response = loop {
             let command = || ShardCommand::Upsert {
                 client_id: "client".into(),
-                request_id: 10,
+                request_id: 11,
                 points: vec![UpsertPoint {
                     id: "after-failover".into(),
                     vector: vec![0.0, 1.0],
@@ -629,10 +766,10 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
-        assert_eq!(response, ShardResponse::Applied { sequence: 2 });
+        assert_eq!(response, ShardResponse::Applied { sequence: 3 });
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while nodes[1].local_len().await < 2 || nodes[2].local_len().await < 2 {
+        while nodes[1].local_len().await < 3 || nodes[2].local_len().await < 3 {
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "post-failover write did not reach both survivors"
@@ -687,7 +824,7 @@ mod tests {
             for node in &restarted {
                 let command = ShardCommand::Upsert {
                     client_id: "client".into(),
-                    request_id: 11,
+                    request_id: 12,
                     points: vec![UpsertPoint {
                         id: "after-restart".into(),
                         vector: vec![1.0, 1.0],
@@ -708,13 +845,13 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
-        assert_eq!(response, ShardResponse::Applied { sequence: 3 });
+        assert_eq!(response, ShardResponse::Applied { sequence: 4 });
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             let mut all_applied = true;
             for node in &restarted {
-                all_applied &= node.local_len().await == 3;
+                all_applied &= node.local_len().await == 4;
             }
             if all_applied {
                 break;
@@ -722,6 +859,66 @@ mod tests {
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "restarted voters did not converge"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            let mut changed = false;
+            for node in &restarted {
+                if node
+                    .change_membership(BTreeSet::from([1, 2]), false)
+                    .await
+                    .is_ok()
+                {
+                    changed = true;
+                    break;
+                }
+            }
+            if changed {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "membership change did not commit"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        let response = loop {
+            let mut committed = None;
+            for node in &restarted[..2] {
+                let command = ShardCommand::Upsert {
+                    client_id: "client".into(),
+                    request_id: 13,
+                    points: vec![UpsertPoint {
+                        id: "after-membership-change".into(),
+                        vector: vec![2.0, 2.0],
+                        metadata: BTreeMap::new(),
+                    }],
+                };
+                if let Ok(response) = node.write(command).await {
+                    committed = Some(response);
+                    break;
+                }
+            }
+            if let Some(response) = committed {
+                break response;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "new voter set did not commit a write"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert_eq!(response, ShardResponse::Applied { sequence: 5 });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while restarted[0].local_len().await < 5 || restarted[1].local_len().await < 5 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "new voter set did not converge"
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }

@@ -48,8 +48,10 @@ and merges shard-local results into a deterministic global top-k.
 
 - Kill a leader after quorum acknowledgement and verify a surviving majority
   elects a leader and commits another write. (Implemented.)
-- Partition the old leader and verify it rejects writes after losing quorum.
+- Partition the old leader and verify it cannot acknowledge while the majority
+  elects a leader and commits. (Implemented.)
 - Restart every voter and verify persisted membership re-elects a leader, all
   replicas catch up, and another write commits. (Implemented.)
 - Corrupt or truncate logs and snapshots and require fail-closed startup.
-- Add and remove voters while writes and queries run.
+- Add and remove voters through joint consensus, then commit under the new voter
+  set. (Implemented.)

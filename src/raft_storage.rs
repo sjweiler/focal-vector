@@ -16,8 +16,10 @@ use tokio::sync::Mutex;
 use crate::UpsertPoint;
 
 const JOURNAL_MAGIC: &[u8; 4] = b"FVRJ";
+const CHECKPOINT_MAGIC: &[u8; 4] = b"FVRC";
 const JOURNAL_VERSION: u8 = 1;
 const MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CHECKPOINT_BYTES: usize = 512 * 1024 * 1024;
 
 pub type NodeId = u64;
 
@@ -57,7 +59,7 @@ enum JournalRecord {
     Purge(LogId<NodeId>),
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct JournalState {
     vote: Option<Vote<NodeId>>,
     committed: Option<LogId<NodeId>>,
@@ -113,7 +115,8 @@ impl DurableRaftLog {
             .write(true)
             .truncate(false)
             .open(path)?;
-        let state = recover_journal(&mut file)?;
+        let checkpoint = read_checkpoint(&directory)?.unwrap_or_default();
+        let state = recover_journal(&mut file, checkpoint)?;
         file.seek(SeekFrom::End(0))?;
         Ok(Self {
             directory: Arc::new(directory),
@@ -229,10 +232,23 @@ impl DurableRaftLog {
         kind: StorageKind,
     ) -> Result<(), StorageError<NodeId>> {
         let mut inner = self.inner.lock().await;
+        let should_checkpoint = matches!(record, JournalRecord::Purge(_));
         if let Err(error) = append_record(&mut inner.file, &record) {
             return Err(kind.error(error));
         }
         inner.state.apply(record);
+        if should_checkpoint {
+            if let Err(error) = write_checkpoint(&self.directory, &inner.state) {
+                return Err(kind.error(error));
+            }
+            if let Err(error) = (|| -> std::io::Result<()> {
+                inner.file.set_len(0)?;
+                inner.file.seek(SeekFrom::Start(0))?;
+                inner.file.sync_data()
+            })() {
+                return Err(kind.error(error));
+            }
+        }
         Ok(())
     }
 }
@@ -278,9 +294,8 @@ fn append_record(file: &mut File, record: &JournalRecord) -> std::io::Result<()>
     result
 }
 
-fn recover_journal(file: &mut File) -> std::io::Result<JournalState> {
+fn recover_journal(file: &mut File, mut state: JournalState) -> std::io::Result<JournalState> {
     file.seek(SeekFrom::Start(0))?;
-    let mut state = JournalState::default();
     loop {
         let start = file.stream_position()?;
         let mut header = [0_u8; 9];
@@ -326,6 +341,65 @@ fn recover_journal(file: &mut File) -> std::io::Result<JournalState> {
         state.apply(record);
     }
     Ok(state)
+}
+
+fn write_checkpoint(directory: &Path, state: &JournalState) -> std::io::Result<()> {
+    let payload = serde_json::to_vec(state).map_err(invalid_data)?;
+    if payload.len() > MAX_CHECKPOINT_BYTES {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "Raft checkpoint exceeds size limit",
+        ));
+    }
+    let length = u64::try_from(payload.len())
+        .map_err(|_| std::io::Error::new(ErrorKind::InvalidInput, "checkpoint is too large"))?;
+    let temporary = directory.join(format!(".raft.checkpoint.tmp-{}", std::process::id()));
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary)?;
+    file.write_all(CHECKPOINT_MAGIC)?;
+    file.write_all(&[JOURNAL_VERSION])?;
+    file.write_all(&length.to_le_bytes())?;
+    file.write_all(&payload)?;
+    file.write_all(&crc32c(&payload).to_le_bytes())?;
+    file.sync_all()?;
+    fs::rename(&temporary, directory.join("raft.checkpoint"))?;
+    File::open(directory)?.sync_all()
+}
+
+fn read_checkpoint(directory: &Path) -> std::io::Result<Option<JournalState>> {
+    let path = directory.join("raft.checkpoint");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    File::open(path)?.read_to_end(&mut bytes)?;
+    if bytes.len() < 17 || &bytes[..4] != CHECKPOINT_MAGIC || bytes[4] != JOURNAL_VERSION {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "invalid Raft checkpoint header",
+        ));
+    }
+    let length = u64::from_le_bytes(bytes[5..13].try_into().expect("eight bytes")) as usize;
+    if length > MAX_CHECKPOINT_BYTES || bytes.len() != 13 + length + 4 {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "invalid Raft checkpoint length",
+        ));
+    }
+    let payload = &bytes[13..13 + length];
+    let stored = u32::from_le_bytes(bytes[13 + length..].try_into().expect("four bytes"));
+    if crc32c(payload) != stored {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "Raft checkpoint checksum mismatch",
+        ));
+    }
+    serde_json::from_slice(payload)
+        .map(Some)
+        .map_err(invalid_data)
 }
 
 fn invalid_data(error: impl std::error::Error + Send + Sync + 'static) -> std::io::Error {
@@ -396,6 +470,11 @@ mod tests {
             .write_record(JournalRecord::Purge(log_id(0)), StorageKind::Logs)
             .await
             .unwrap();
+        assert_eq!(
+            fs::metadata(directory.join("raft.journal")).unwrap().len(),
+            0
+        );
+        assert!(directory.join("raft.checkpoint").is_file());
         drop(store);
 
         let mut reopened = DurableRaftLog::open(&directory).unwrap();
@@ -434,6 +513,27 @@ mod tests {
         let mut bytes = fs::read(&path).unwrap();
         bytes[10] ^= 0x40;
         fs::write(&path, bytes).unwrap();
+        assert_eq!(
+            DurableRaftLog::open(&directory).unwrap_err().kind(),
+            ErrorKind::InvalidData
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn checkpoint_corruption_fails_closed() {
+        let directory = directory("checkpoint-corruption");
+        let store = DurableRaftLog::open(&directory).unwrap();
+        store
+            .write_record(JournalRecord::Purge(log_id(0)), StorageKind::Logs)
+            .await
+            .unwrap();
+        drop(store);
+        let path = directory.join("raft.checkpoint");
+        let mut bytes = fs::read(&path).unwrap();
+        let payload_index = 13;
+        bytes[payload_index] ^= 0x80;
+        fs::write(path, bytes).unwrap();
         assert_eq!(
             DurableRaftLog::open(&directory).unwrap_err().kind(),
             ErrorKind::InvalidData

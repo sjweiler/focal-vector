@@ -3,7 +3,7 @@
 [![Rust](https://img.shields.io/badge/Rust-2024%20edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Dependencies](https://img.shields.io/badge/Runtime%20dependencies-7-brightgreen.svg)](Cargo.toml)
-[![Tests](https://img.shields.io/badge/Tests-46%20passing-brightgreen.svg)](#try-it)
+[![Tests](https://img.shields.io/badge/Tests-47%20passing-brightgreen.svg)](#try-it)
 
 Focal Vector is a design for a low-latency, durable vector database. The first
 release is deliberately single-node: it optimizes the data path before adding
@@ -135,12 +135,32 @@ curl -X POST http://127.0.0.1:8101/v1/raft/initialize \
 ```
 
 Peer and administration traffic is authenticated but uses HTTP. Use a private
-network or mutually authenticated TLS proxy between hosts.
+network or mutually authenticated TLS proxy between hosts. Peer and coordinator
+addresses may include an explicit `https://` scheme when routed through TLS.
+Node health and readiness are exposed at `/healthz` and `/readyz`; authenticated
+Raft state is available at `/v1/raft/status`.
 
 Applications can construct `DistributedCollection` with one `ReplicaSet` per
 shard. It hashes writes to the correct replicated shard, tries replicas until a
 leader responds, searches shard leaders concurrently, and merges their results
 into a deterministic global top-k.
+
+Consensus purge operations atomically checkpoint the complete log state before
+truncating the append journal, preventing unbounded journal growth. Checkpoints
+are CRC32C-protected and corruption causes startup to fail closed.
+
+Benchmark a deployed set of replicated shards (semicolons separate shards;
+commas separate replicas within a shard):
+
+```bash
+FOCAL_SHARDS='https://s0n1,https://s0n2,https://s0n3;https://s1n1,https://s1n2,https://s1n3' \
+FOCAL_RAFT_TOKEN=change-me FOCAL_DIMENSION=768 \
+cargo run --release --bin focal-distributed-bench
+```
+
+The client reports ingest vectors/second and query QPS with p50, p95, and p99
+latency. Configure point count, query count, and top-k through
+`FOCAL_BENCH_POINTS`, `FOCAL_BENCH_QUERIES`, and `FOCAL_BENCH_K`.
 
 ```rust
 use std::collections::BTreeMap;
