@@ -893,7 +893,10 @@ mod tests {
             .unwrap();
         assert!(state.has_approximate_index().await);
         assert_eq!(state.pending_point_count().await, 0);
-        assert_eq!(state.search(vec![1.0, 0.0], 1, None).await.unwrap()[0].id, "bulk-255");
+        assert_eq!(
+            state.search(vec![1.0, 0.0], 1, None).await.unwrap()[0].id,
+            "bulk-255"
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 }

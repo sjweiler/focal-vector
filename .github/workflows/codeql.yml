@@ -37,14 +37,10 @@ jobs:
         uses: github/codeql-action/init@v4.37.3
         with:
           languages: rust
-          build-mode: manual
+          build-mode: none
           queries: security-extended
-
-      - name: Build
-        run: cargo +stable build --all-targets --locked
 
       - name: Analyze
         uses: github/codeql-action/analyze@v4.37.3
         with:
           category: /language:rust
-
