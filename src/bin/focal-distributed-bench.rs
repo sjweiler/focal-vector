@@ -75,36 +75,50 @@ fn exact_ids(
     metric: Metric,
 ) -> HashSet<String> {
     let query_norm = query.iter().map(|value| value * value).sum::<f32>().sqrt();
-    let mut scored: Vec<_> = (0..point_count)
-        .map(|index| {
-            let point = vector(index as u64 + 1, dimension);
-            let score = match metric {
-                Metric::DotProduct => query
+    let mut scored = Vec::with_capacity(k);
+    for index in 0..point_count {
+        let point = vector(index as u64 + 1, dimension);
+        let score = match metric {
+            Metric::DotProduct => query
+                .iter()
+                .zip(&point)
+                .map(|(left, right)| left * right)
+                .sum(),
+            Metric::Cosine => {
+                let point_norm = point.iter().map(|value| value * value).sum::<f32>().sqrt();
+                query
                     .iter()
                     .zip(&point)
                     .map(|(left, right)| left * right)
-                    .sum(),
-                Metric::Cosine => {
-                    let point_norm = point.iter().map(|value| value * value).sum::<f32>().sqrt();
-                    query
-                        .iter()
-                        .zip(&point)
-                        .map(|(left, right)| left * right)
-                        .sum::<f32>()
-                        / (query_norm * point_norm)
-                }
-                Metric::Euclidean => -query
-                    .iter()
-                    .zip(&point)
-                    .map(|(left, right)| {
-                        let difference = left - right;
-                        difference * difference
-                    })
-                    .sum::<f32>(),
-            };
-            (index, score)
-        })
-        .collect();
+                    .sum::<f32>()
+                    / (query_norm * point_norm)
+            }
+            Metric::Euclidean => -query
+                .iter()
+                .zip(&point)
+                .map(|(left, right)| {
+                    let difference = left - right;
+                    difference * difference
+                })
+                .sum::<f32>(),
+        };
+        if scored.len() < k {
+            scored.push((index, score));
+            continue;
+        }
+        let (worst_position, &(worst_id, worst_score)) = scored
+            .iter()
+            .enumerate()
+            .min_by(|(_, (left_id, left_score)), (_, (right_id, right_score))| {
+                left_score
+                    .total_cmp(right_score)
+                    .then_with(|| right_id.cmp(left_id))
+            })
+            .expect("k is positive");
+        if score > worst_score || (score == worst_score && index < worst_id) {
+            scored[worst_position] = (index, score);
+        }
+    }
     scored.sort_unstable_by(|(left_id, left), (right_id, right)| {
         right.total_cmp(left).then_with(|| left_id.cmp(right_id))
     });
@@ -133,6 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let token = required("FOCAL_RAFT_TOKEN")?;
     let dimension = number("FOCAL_DIMENSION", 128)?;
     let point_count = number("FOCAL_BENCH_POINTS", 10_000)?;
+    let batch_points = number("FOCAL_BENCH_BATCH_POINTS", 1_000)?;
     let query_count = number("FOCAL_BENCH_QUERIES", 100)?;
     let k = number("FOCAL_BENCH_K", 10)?;
     let ef_search = number("FOCAL_BENCH_EF_SEARCH", k.saturating_mul(16).max(256))?;
@@ -141,6 +156,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let metric = metric()?;
     if dimension == 0
         || point_count == 0
+        || batch_points == 0
         || query_count == 0
         || k == 0
         || ef_search < k
@@ -150,24 +166,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("benchmark dimensions and counts must be positive".into());
     }
 
+    let shard_count = shards.len();
+    let replica_count: usize = shards.iter().map(|shard| shard.addresses.len()).sum();
     let collection = DistributedCollection::with_http_client(
         shards,
         token,
         build_http_client(tls_config()?.as_ref())?,
     )?;
-    let points: Vec<_> = (0..point_count)
-        .map(|index| UpsertPoint {
-            id: format!("bench-{index:012}"),
-            vector: vector(index as u64 + 1, dimension),
-            metadata: BTreeMap::new(),
-        })
-        .collect();
-    let request_id = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64;
+    let request_id = SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros() as u64;
     let ingest_start = Instant::now();
-    collection
-        .upsert("focal-distributed-bench", request_id, points)
-        .await?;
+    let batch_count = point_count.div_ceil(batch_points);
+    let progress_interval = batch_count.div_ceil(20).max(1);
+    for (batch_index, start) in (0..point_count).step_by(batch_points).enumerate() {
+        let end = start.saturating_add(batch_points).min(point_count);
+        let points = (start..end)
+            .map(|index| UpsertPoint {
+                id: format!("bench-{index:012}"),
+                vector: vector(index as u64 + 1, dimension),
+                metadata: BTreeMap::new(),
+            })
+            .collect();
+        collection
+            .upsert(
+                "focal-distributed-bench",
+                request_id
+                    .checked_add(batch_index as u64)
+                    .ok_or("benchmark request ID overflow")?,
+                points,
+            )
+            .await?;
+        if (batch_index + 1) % progress_interval == 0 || end == point_count {
+            eprintln!(
+                "ingest_progress={end}/{point_count} ({:.1}%) elapsed_seconds={:.1}",
+                end as f64 * 100.0 / point_count as f64,
+                ingest_start.elapsed().as_secs_f64()
+            );
+        }
+    }
     let ingest_elapsed = ingest_start.elapsed();
+
+    eprintln!("building_or_refreshing_indexes_with_warmup_query");
+    let warmup_start = Instant::now();
+    let warmup = collection
+        .search_result_with_ef(
+            vector(point_count as u64 + 1, dimension),
+            k,
+            None,
+            ef_search,
+            false,
+        )
+        .await?;
+    if warmup.hits.is_empty() {
+        return Err("warm-up query unexpectedly returned no results".into());
+    }
+    let warmup_elapsed = warmup_start.elapsed();
 
     let mut latencies = Vec::with_capacity(query_count);
     let mut query_results = Vec::with_capacity(query_count);
@@ -202,13 +254,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("shards={}", collection.shard_count());
     println!(
-        "points={point_count} dimension={dimension} queries={query_count} k={k} ef_search={ef_search} concurrency={concurrency}"
+        "points={point_count} dimension={dimension} batch_points={batch_points} batches={batch_count} queries={query_count} k={k} ef_search={ef_search} concurrency={concurrency}"
+    );
+    let logical_vector_bytes = point_count as u128 * dimension as u128 * 4;
+    let replicated_vector_bytes =
+        logical_vector_bytes * replica_count as u128 / shard_count as u128;
+    println!(
+        "replicas={replica_count} raw_vector_gib_lower_bound={:.3} estimated_replicated_raw_vector_gib_lower_bound={:.3}",
+        logical_vector_bytes as f64 / 1024_f64.powi(3),
+        replicated_vector_bytes as f64 / 1024_f64.powi(3)
     );
     println!(
         "ingest_seconds={:.3} ingest_vectors_per_second={:.1}",
         ingest_elapsed.as_secs_f64(),
         point_count as f64 / ingest_elapsed.as_secs_f64()
     );
+    println!("index_warmup_seconds={:.3}", warmup_elapsed.as_secs_f64());
     let mut recalled = 0_usize;
     for (index, result) in query_results
         .iter()

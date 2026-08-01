@@ -80,6 +80,7 @@ pub struct DurableShardStateMachine {
     directory: Arc<PathBuf>,
     config: CollectionConfig,
     inner: Arc<Mutex<StateInner>>,
+    index_refresh: Arc<Mutex<()>>,
 }
 
 impl DurableShardStateMachine {
@@ -131,12 +132,6 @@ impl DurableShardStateMachine {
             )?;
         }
         journal.seek(SeekFrom::End(0))?;
-        if should_rebuild_index(index.as_ref(), dirty_ids.len(), collection.len()) {
-            let indexes = build_indexes(config, &collection.snapshot_points())?;
-            index = Some(indexes.0);
-            metadata_index = Some(indexes.1);
-            dirty_ids.clear();
-        }
         Ok(Self {
             directory: Arc::new(directory),
             config,
@@ -151,7 +146,43 @@ impl DurableShardStateMachine {
                 dedup,
                 current_snapshot,
             })),
+            index_refresh: Arc::new(Mutex::new(())),
         })
+    }
+
+    async fn refresh_index_if_needed(&self) -> FocalResult<()> {
+        let _refresh = self.index_refresh.lock().await;
+        let rebuild = {
+            let inner = self.inner.lock().await;
+            should_rebuild_index(
+                inner.index.as_ref(),
+                inner.dirty_ids.len(),
+                inner.collection.len(),
+            )
+            .then(|| {
+                (
+                    inner.collection.latest_sequence(),
+                    inner.collection.snapshot_points(),
+                )
+            })
+        };
+        let Some((sequence, points)) = rebuild else {
+            return Ok(());
+        };
+        let config = self.config;
+        let (index, metadata_index) =
+            tokio::task::spawn_blocking(move || build_indexes(config, &points))
+                .await
+                .map_err(|error| {
+                    Error::Concurrency(format!("HNSW index task failed: {error}"))
+                })??;
+        let mut inner = self.inner.lock().await;
+        if inner.collection.latest_sequence() == sequence {
+            inner.index = Some(index);
+            inner.metadata_index = Some(metadata_index);
+            inner.dirty_ids.clear();
+        }
+        Ok(())
     }
 
     pub async fn search(
@@ -174,6 +205,7 @@ impl DurableShardStateMachine {
         if ef_search < k {
             return Err(Error::InvalidQuery("ef_search must be at least k"));
         }
+        self.refresh_index_if_needed().await?;
         let inner = self.inner.lock().await;
         let filter = filter.cloned();
         let Some(index) = &inner.index else {
@@ -327,28 +359,6 @@ impl RaftStateMachine<FocalRaftConfig> for DurableShardStateMachine {
             replay_record_inner(&mut inner, record)
                 .map_err(|error| StorageIOError::write_state_machine(&error))?;
             responses.push(response);
-        }
-        let rebuild = should_rebuild_index(
-            inner.index.as_ref(),
-            inner.dirty_ids.len(),
-            inner.collection.len(),
-        )
-        .then(|| {
-            (
-                inner.collection.latest_sequence(),
-                inner.collection.snapshot_points(),
-            )
-        });
-        drop(inner);
-        if let Some((sequence, points)) = rebuild
-            && let Ok((index, metadata_index)) = build_indexes(self.config, &points)
-        {
-            let mut inner = self.inner.lock().await;
-            if inner.collection.latest_sequence() == sequence {
-                inner.index = Some(index);
-                inner.metadata_index = Some(metadata_index);
-                inner.dirty_ids.clear();
-            }
         }
         Ok(responses)
     }
@@ -1026,7 +1036,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bulk_load_builds_index_without_waiting_for_a_raft_snapshot() {
+    async fn bulk_load_builds_index_lazily_on_first_search() {
         let directory = directory();
         let mut state = DurableShardStateMachine::open(&directory, config()).unwrap();
         let points = (0..MIN_REINDEXED_POINTS)
@@ -1047,12 +1057,14 @@ mod tests {
             }])
             .await
             .unwrap();
-        assert!(state.has_approximate_index().await);
-        assert_eq!(state.pending_point_count().await, 0);
+        assert!(!state.has_approximate_index().await);
+        assert_eq!(state.pending_point_count().await, MIN_REINDEXED_POINTS);
         assert_eq!(
             state.search(vec![1.0, 0.0], 1, None).await.unwrap()[0].id,
             "bulk-255"
         );
+        assert!(state.has_approximate_index().await);
+        assert_eq!(state.pending_point_count().await, 0);
         fs::remove_dir_all(directory).unwrap();
     }
 

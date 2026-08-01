@@ -173,6 +173,12 @@ cargo run --release --bin focal-distributed-bench
 The client reports ingest vectors/second and query QPS with p50, p95, and p99
 latency. Configure point count, query count, and top-k through
 `FOCAL_BENCH_POINTS`, `FOCAL_BENCH_QUERIES`, and `FOCAL_BENCH_K`. Set
+`FOCAL_BENCH_BATCH_POINTS` to bound each ingestion request (the default is
+1,000). Writes accumulate an exact-search delta and HNSW is built lazily by the
+benchmark's warm-up query after ingestion, avoiding repeated graph rebuilds
+during bulk loading. The report separates ingestion from index warm-up time and
+prints raw-vector memory lower bounds; actual process memory is higher because
+of graph, metadata, Raft, allocator, and runtime overhead. Set
 `FOCAL_BENCH_EF_SEARCH` to tune HNSW recall versus latency (the default is
 `max(16 * k, 256)`). Replicated graphs use `M=32` and `ef_construction=400` to
 favor recall. `FOCAL_BENCH_CONCURRENCY` controls concurrent clients and
@@ -182,10 +188,16 @@ report includes throughput, p50/p95/p99, recall@k, and the minimum applied index
 A representative million-vector run can be launched against a deployed cluster:
 
 ```bash
-FOCAL_BENCH_POINTS=1000000 FOCAL_BENCH_QUERIES=1000 \
-FOCAL_BENCH_CONCURRENCY=32 FOCAL_BENCH_RECALL_QUERIES=20 \
+FOCAL_SHARDS='http://127.0.0.1:8101,http://127.0.0.1:8102,http://127.0.0.1:8103' \
+FOCAL_RAFT_TOKEN=change-me FOCAL_BENCH_POINTS=1000000 \
+FOCAL_BENCH_QUERIES=1000 \
+FOCAL_BENCH_BATCH_POINTS=1000 FOCAL_BENCH_CONCURRENCY=32 \
+FOCAL_BENCH_RECALL_QUERIES=20 \
 cargo run --release --bin focal-distributed-bench
 ```
+
+TLS is optional for a local run. Leave all `FOCAL_TLS_*` variables unset and
+use `http://127.0.0.1:PORT` addresses in `FOCAL_SHARDS`.
 
 Treat results as hardware- and embedding-specific; the repository does not
 claim the 1M-vector SLO until this command is run on the intended deployment.
