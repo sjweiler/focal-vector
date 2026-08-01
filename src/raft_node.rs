@@ -31,6 +31,12 @@ type SnapshotRpcError = RPCError<NodeId, BasicNode, RaftError<NodeId, InstallSna
 const MAX_CLIENT_BODY_BYTES: usize = 64 * 1024 * 1024;
 const MAX_IN_FLIGHT_CLIENT_OPERATIONS: usize = 256;
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShardSearchResult {
+    pub hits: Vec<SearchHit>,
+    pub applied_index: Option<u64>,
+}
+
 #[derive(Clone)]
 pub struct HttpRaftNetwork {
     client: reqwest::Client,
@@ -41,13 +47,14 @@ pub struct HttpRaftNetwork {
 
 impl HttpRaftNetwork {
     pub fn new(token: impl Into<String>) -> Result<Self> {
+        Self::with_client(token, crate::build_http_client(None)?)
+    }
+
+    pub fn with_client(token: impl Into<String>, client: reqwest::Client) -> Result<Self> {
         let token = token.into();
         if token.is_empty() {
             return Err(Error::InvalidConfig("Raft peer token must not be empty"));
         }
-        let client = reqwest::Client::builder()
-            .build()
-            .map_err(|error| Error::Concurrency(error.to_string()))?;
         Ok(Self {
             client,
             token: Arc::from(token),
@@ -195,9 +202,28 @@ impl RaftNode {
         peer_token: impl Into<String>,
         raft_config: Config,
     ) -> Result<Self> {
+        Self::open_with_http_client(
+            id,
+            directory,
+            collection_config,
+            peer_token,
+            raft_config,
+            crate::build_http_client(None)?,
+        )
+        .await
+    }
+
+    pub async fn open_with_http_client(
+        id: NodeId,
+        directory: impl AsRef<Path>,
+        collection_config: CollectionConfig,
+        peer_token: impl Into<String>,
+        raft_config: Config,
+        http_client: reqwest::Client,
+    ) -> Result<Self> {
         let token = peer_token.into();
         persist_node_id(directory.as_ref(), id)?;
-        let network = HttpRaftNetwork::new(token.clone())?;
+        let network = HttpRaftNetwork::with_client(token.clone(), http_client)?;
         let log_store = DurableRaftLog::open(directory.as_ref().join("log"))?;
         let state_machine =
             DurableShardStateMachine::open(directory.as_ref().join("state"), collection_config)?;
@@ -277,7 +303,7 @@ impl RaftNode {
         k: usize,
         filter: Option<&Filter>,
     ) -> Result<Vec<SearchHit>> {
-        self.search_with_ef(query, k, filter, k.saturating_mul(4).max(96))
+        self.search_with_ef(query, k, filter, k.saturating_mul(16).max(256))
             .await
     }
 
@@ -288,17 +314,39 @@ impl RaftNode {
         filter: Option<&Filter>,
         ef_search: usize,
     ) -> Result<Vec<SearchHit>> {
+        Ok(self
+            .search_indexed(query, k, filter, ef_search, true)
+            .await?
+            .hits)
+    }
+
+    pub async fn search_indexed(
+        &self,
+        query: Vec<f32>,
+        k: usize,
+        filter: Option<&Filter>,
+        ef_search: usize,
+        linearizable: bool,
+    ) -> Result<ShardSearchResult> {
         let _permit =
             self.network.admission.try_acquire().map_err(|_| {
                 Error::ResourceExhausted("Raft client operation limit reached".into())
             })?;
-        self.raft
-            .ensure_linearizable()
-            .await
-            .map_err(|error| Error::Concurrency(error.to_string()))?;
-        self.state_machine
+        if linearizable {
+            self.raft
+                .ensure_linearizable()
+                .await
+                .map_err(|error| Error::Concurrency(error.to_string()))?;
+        }
+        let applied_index = self.state_machine.applied_index().await;
+        let hits = self
+            .state_machine
             .search_with_ef(query, k, filter, ef_search)
-            .await
+            .await?;
+        Ok(ShardSearchResult {
+            hits,
+            applied_index,
+        })
     }
 
     pub async fn local_len(&self) -> usize {
@@ -340,6 +388,7 @@ pub fn raft_router(node: Arc<RaftNode>) -> Router {
         .route("/v1/raft/initialize", post(initialize_cluster))
         .route("/v1/raft/write", post(client_write))
         .route("/v1/raft/query", post(linearizable_query))
+        .route("/v1/raft/query/stale", post(stale_query))
         .route("/v1/raft/learners/{id}", post(add_learner))
         .route("/v1/raft/membership", post(change_membership))
         .route("/v1/raft/status", get(raft_status))
@@ -431,17 +480,40 @@ async fn linearizable_query(
     State(node): State<Arc<RaftNode>>,
     headers: HeaderMap,
     Json(request): Json<QueryRequest>,
-) -> std::result::Result<Json<Vec<SearchHit>>, ApiFailure> {
+) -> std::result::Result<Json<ShardSearchResult>, ApiFailure> {
     if !authorized(&headers, &node.token) {
         return Err(unauthorized());
     }
-    node.search_with_ef(
+    node.search_indexed(
         request.vector,
         request.k,
         request.filter.as_ref(),
         request
             .ef_search
-            .unwrap_or_else(|| request.k.saturating_mul(4).max(96)),
+            .unwrap_or_else(|| request.k.saturating_mul(16).max(256)),
+        true,
+    )
+    .await
+    .map(Json)
+    .map_err(api_error)
+}
+
+async fn stale_query(
+    State(node): State<Arc<RaftNode>>,
+    headers: HeaderMap,
+    Json(request): Json<QueryRequest>,
+) -> std::result::Result<Json<ShardSearchResult>, ApiFailure> {
+    if !authorized(&headers, &node.token) {
+        return Err(unauthorized());
+    }
+    node.search_indexed(
+        request.vector,
+        request.k,
+        request.filter.as_ref(),
+        request
+            .ef_search
+            .unwrap_or_else(|| request.k.saturating_mul(16).max(256)),
+        false,
     )
     .await
     .map(Json)
@@ -710,6 +782,17 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+        let follower = if nodes[1].local_len().await == 1 {
+            &nodes[1]
+        } else {
+            &nodes[2]
+        };
+        let stale = follower
+            .search_indexed(vec![1.0, 0.0], 1, None, 96, false)
+            .await
+            .unwrap();
+        assert_eq!(stale.hits[0].id, "replicated");
+        assert!(stale.applied_index.is_some());
 
         nodes[0].set_peer_blocked(2, true).unwrap();
         nodes[0].set_peer_blocked(3, true).unwrap();

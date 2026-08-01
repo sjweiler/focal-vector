@@ -13,6 +13,7 @@ use openraft::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
+use crate::metadata_index::MetadataIndex;
 use crate::raft_storage::{FocalRaftConfig, NodeId, ShardCommand, ShardResponse};
 use crate::{
     Collection, CollectionConfig, Error, Filter, HnswConfig, HnswIndex, Result as FocalResult,
@@ -22,6 +23,8 @@ use crate::{
 const STATE_MAGIC: &[u8; 4] = b"FVRS";
 const STATE_VERSION: u8 = 1;
 const MAX_STATE_RECORD_BYTES: usize = 256 * 1024 * 1024;
+const SNAPSHOT_MAGIC: &[u8; 4] = b"FVSS";
+const SNAPSHOT_VERSION: u8 = 1;
 const MIN_REINDEXED_POINTS: usize = 256;
 const REINDEX_DIRTY_DIVISOR: usize = 5;
 
@@ -55,6 +58,8 @@ struct StateSnapshot {
 struct StoredSnapshot {
     meta: SnapshotMeta<NodeId, openraft::BasicNode>,
     data: Vec<u8>,
+    #[serde(default)]
+    checksum: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -62,6 +67,7 @@ struct StateInner {
     journal: File,
     collection: Collection,
     index: Option<HnswIndex>,
+    metadata_index: Option<MetadataIndex>,
     dirty_ids: HashSet<String>,
     last_applied: Option<LogId<NodeId>>,
     membership: StoredMembership<NodeId, openraft::BasicNode>,
@@ -85,17 +91,19 @@ impl DurableShardStateMachine {
         let mut membership = StoredMembership::default();
         let mut dedup = BTreeMap::new();
         let mut index = None;
+        let mut metadata_index = None;
         let mut dirty_ids = HashSet::new();
         let current_snapshot = read_snapshot(&directory)?;
         if let Some(stored) = &current_snapshot {
-            let snapshot: StateSnapshot = serde_json::from_slice(&stored.data)
-                .map_err(|error| Error::CorruptStorage(error.to_string()))?;
+            let snapshot = decode_state_snapshot(&stored.data)?;
             if snapshot.config != config {
                 return Err(Error::CorruptStorage(
                     "Raft snapshot collection configuration mismatch".into(),
                 ));
             }
-            index = Some(build_index(config, &snapshot.points)?);
+            let indexes = build_indexes(config, &snapshot.points)?;
+            index = Some(indexes.0);
+            metadata_index = Some(indexes.1);
             collection.restore_snapshot(snapshot.points, snapshot.collection_sequence)?;
             last_applied = snapshot.last_applied;
             membership = snapshot.membership;
@@ -124,7 +132,9 @@ impl DurableShardStateMachine {
         }
         journal.seek(SeekFrom::End(0))?;
         if should_rebuild_index(index.as_ref(), dirty_ids.len(), collection.len()) {
-            index = Some(build_index(config, &collection.snapshot_points())?);
+            let indexes = build_indexes(config, &collection.snapshot_points())?;
+            index = Some(indexes.0);
+            metadata_index = Some(indexes.1);
             dirty_ids.clear();
         }
         Ok(Self {
@@ -134,6 +144,7 @@ impl DurableShardStateMachine {
                 journal,
                 collection,
                 index,
+                metadata_index,
                 dirty_ids,
                 last_applied,
                 membership,
@@ -149,7 +160,7 @@ impl DurableShardStateMachine {
         k: usize,
         filter: Option<&Filter>,
     ) -> FocalResult<Vec<SearchHit>> {
-        self.search_with_ef(query, k, filter, k.saturating_mul(4).max(96))
+        self.search_with_ef(query, k, filter, k.saturating_mul(16).max(256))
             .await
     }
 
@@ -164,18 +175,59 @@ impl DurableShardStateMachine {
             return Err(Error::InvalidQuery("ef_search must be at least k"));
         }
         let inner = self.inner.lock().await;
-        if filter.is_some() {
-            return inner.collection.search(query, k, filter);
-        }
+        let filter = filter.cloned();
         let Some(index) = &inner.index else {
-            return inner.collection.search(query, k, None);
+            return inner.collection.search(query, k, filter.as_ref());
         };
-        let graph_k = k.saturating_add(inner.dirty_ids.len()).min(index.len());
+        let mut filtered_candidates = None;
+        if let Some(filter) = &filter {
+            let Some(metadata_index) = &inner.metadata_index else {
+                return inner.collection.search(query, k, Some(filter));
+            };
+            let mut candidates = metadata_index.candidates(filter);
+            candidates.retain(|id| !inner.dirty_ids.contains(id));
+            let use_exact = candidates.len().saturating_mul(4) < index.len()
+                || candidates.len() <= k.saturating_mul(16).max(256);
+            if use_exact {
+                let mut hits =
+                    inner
+                        .collection
+                        .search_ids(query.clone(), k, &candidates, Some(filter))?;
+                hits.extend(inner.collection.search_ids(
+                    query,
+                    k,
+                    &inner.dirty_ids,
+                    Some(filter),
+                )?);
+                return Ok(merge_hits(hits, k));
+            }
+            filtered_candidates = Some(candidates);
+        }
+        let mut graph_k = if filter.is_some() {
+            ef_search
+                .max(k.saturating_mul(8))
+                .saturating_add(inner.dirty_ids.len())
+                .min(index.len())
+        } else {
+            k.saturating_add(inner.dirty_ids.len()).min(index.len())
+        };
         let mut hits = Vec::with_capacity(graph_k.saturating_add(k));
-        if graph_k > 0 {
+        while graph_k > 0 {
+            hits.clear();
             for hit in index.search(query.clone(), graph_k, ef_search.max(graph_k))? {
                 if inner.dirty_ids.contains(&hit.id) {
                     continue;
+                }
+                if let Some(filter) = &filter {
+                    let Some(point) = inner.collection.get(&hit.id) else {
+                        return Err(Error::CorruptStorage(format!(
+                            "HNSW point {} is missing from the Raft state machine",
+                            hit.id
+                        )));
+                    };
+                    if !filter.matches(&point.metadata) {
+                        continue;
+                    }
                 }
                 let point = inner.collection.get(&hit.id).ok_or_else(|| {
                     Error::CorruptStorage(format!(
@@ -190,11 +242,24 @@ impl DurableShardStateMachine {
                     sequence: point.sequence,
                 });
             }
+            if filter.is_none() || hits.len() >= k || graph_k == index.len() {
+                break;
+            }
+            graph_k = graph_k.saturating_mul(2).min(index.len());
+        }
+        if hits.len() < k
+            && let (Some(filter), Some(candidates)) = (&filter, &filtered_candidates)
+        {
+            hits.extend(
+                inner
+                    .collection
+                    .search_ids(query.clone(), k, candidates, Some(filter))?,
+            );
         }
         hits.extend(
             inner
                 .collection
-                .search_ids(query, k, &inner.dirty_ids, None)?,
+                .search_ids(query, k, &inner.dirty_ids, filter.as_ref())?,
         );
         Ok(merge_hits(hits, k))
     }
@@ -205,6 +270,14 @@ impl DurableShardStateMachine {
 
     pub async fn pending_point_count(&self) -> usize {
         self.inner.lock().await.dirty_ids.len()
+    }
+
+    pub async fn applied_index(&self) -> Option<u64> {
+        self.inner
+            .lock()
+            .await
+            .last_applied
+            .map(|log_id| log_id.index)
     }
 
     pub async fn len(&self) -> usize {
@@ -268,11 +341,12 @@ impl RaftStateMachine<FocalRaftConfig> for DurableShardStateMachine {
         });
         drop(inner);
         if let Some((sequence, points)) = rebuild
-            && let Ok(index) = build_index(self.config, &points)
+            && let Ok((index, metadata_index)) = build_indexes(self.config, &points)
         {
             let mut inner = self.inner.lock().await;
             if inner.collection.latest_sequence() == sequence {
                 inner.index = Some(index);
+                inner.metadata_index = Some(metadata_index);
                 inner.dirty_ids.clear();
             }
         }
@@ -295,20 +369,23 @@ impl RaftStateMachine<FocalRaftConfig> for DurableShardStateMachine {
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<NodeId>> {
         let data = snapshot.into_inner();
-        let decoded: StateSnapshot = serde_json::from_slice(&data)
+        let decoded = decode_state_snapshot(&data)
             .map_err(|error| StorageIOError::read_snapshot(Some(meta.signature()), &error))?;
         if decoded.config != self.config {
             let error = std::io::Error::new(ErrorKind::InvalidData, "snapshot config mismatch");
             return Err(StorageIOError::read_snapshot(Some(meta.signature()), &error).into());
         }
+        let checksum = stored_snapshot_checksum(meta, &data)
+            .map_err(|error| StorageIOError::write_snapshot(Some(meta.signature()), &error))?;
         let stored = StoredSnapshot {
             meta: meta.clone(),
             data,
+            checksum: Some(checksum),
         };
         write_snapshot(&self.snapshot_path(), &stored)
             .map_err(|error| StorageIOError::write_snapshot(Some(meta.signature()), &error))?;
 
-        let index = build_index(decoded.config, &decoded.points)
+        let (index, metadata_index) = build_indexes(decoded.config, &decoded.points)
             .map_err(|error| StorageIOError::read_state_machine(&error))?;
         let mut collection = Collection::new(decoded.config)
             .map_err(|error| StorageIOError::read_state_machine(&error))?;
@@ -330,6 +407,7 @@ impl RaftStateMachine<FocalRaftConfig> for DurableShardStateMachine {
             .map_err(|error| StorageIOError::write_state_machine(&error))?;
         inner.collection = collection;
         inner.index = Some(index);
+        inner.metadata_index = Some(metadata_index);
         inner.dirty_ids.clear();
         inner.last_applied = decoded.last_applied;
         inner.membership = decoded.membership;
@@ -365,9 +443,9 @@ impl RaftSnapshotBuilder<FocalRaftConfig> for DurableShardStateMachine {
             membership: inner.membership.clone(),
             dedup: inner.dedup.clone(),
         };
-        let index = build_index(self.config, &snapshot.points)
+        let (index, metadata_index) = build_indexes(self.config, &snapshot.points)
             .map_err(|error| StorageIOError::write_snapshot(None, &error))?;
-        let data = serde_json::to_vec(&snapshot)
+        let data = encode_state_snapshot(&snapshot)
             .map_err(|error| StorageIOError::write_snapshot(None, &error))?;
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -378,14 +456,18 @@ impl RaftSnapshotBuilder<FocalRaftConfig> for DurableShardStateMachine {
             last_membership: inner.membership.clone(),
             snapshot_id: format!("{}-{nonce}", inner.last_applied.map_or(0, |log| log.index)),
         };
+        let checksum = stored_snapshot_checksum(&meta, &data)
+            .map_err(|error| StorageIOError::write_snapshot(Some(meta.signature()), &error))?;
         let stored = StoredSnapshot {
             meta: meta.clone(),
             data: data.clone(),
+            checksum: Some(checksum),
         };
         write_snapshot(&self.snapshot_path(), &stored)
             .map_err(|error| StorageIOError::write_snapshot(Some(meta.signature()), &error))?;
         inner.current_snapshot = Some(stored);
         inner.index = Some(index);
+        inner.metadata_index = Some(metadata_index);
         inner.dirty_ids.clear();
         Ok(Snapshot {
             meta,
@@ -530,15 +612,71 @@ fn replay_record(
     Ok(())
 }
 
-fn build_index(config: CollectionConfig, points: &[crate::Point]) -> FocalResult<HnswIndex> {
-    HnswIndex::build(
+fn build_indexes(
+    config: CollectionConfig,
+    points: &[crate::Point],
+) -> FocalResult<(HnswIndex, MetadataIndex)> {
+    let index = HnswIndex::build(
         config.dimension,
         config.metric,
-        HnswConfig::default(),
+        HnswConfig {
+            m: 32,
+            ef_construction: 400,
+        },
         points
             .iter()
             .map(|point| (point.id.clone(), point.vector.clone())),
-    )
+    )?;
+    Ok((index, MetadataIndex::build(points)))
+}
+
+fn encode_state_snapshot(snapshot: &StateSnapshot) -> FocalResult<Vec<u8>> {
+    let payload =
+        serde_json::to_vec(snapshot).map_err(|error| Error::CorruptStorage(error.to_string()))?;
+    let length = u64::try_from(payload.len())
+        .map_err(|_| Error::CorruptStorage("Raft snapshot is too large".into()))?;
+    let mut encoded = Vec::with_capacity(17_usize.saturating_add(payload.len()));
+    encoded.extend_from_slice(SNAPSHOT_MAGIC);
+    encoded.push(SNAPSHOT_VERSION);
+    encoded.extend_from_slice(&length.to_le_bytes());
+    encoded.extend_from_slice(&payload);
+    encoded.extend_from_slice(&crc32c(&payload).to_le_bytes());
+    Ok(encoded)
+}
+
+fn decode_state_snapshot(bytes: &[u8]) -> FocalResult<StateSnapshot> {
+    if !bytes.starts_with(SNAPSHOT_MAGIC) {
+        return serde_json::from_slice(bytes)
+            .map_err(|error| Error::CorruptStorage(error.to_string()));
+    }
+    if bytes.len() < 17 || bytes[4] != SNAPSHOT_VERSION {
+        return Err(Error::CorruptStorage("invalid Raft snapshot header".into()));
+    }
+    let length = u64::from_le_bytes(
+        bytes[5..13]
+            .try_into()
+            .expect("snapshot length is eight bytes"),
+    );
+    let length = usize::try_from(length)
+        .map_err(|_| Error::CorruptStorage("Raft snapshot length is too large".into()))?;
+    let expected = 17_usize
+        .checked_add(length)
+        .ok_or_else(|| Error::CorruptStorage("Raft snapshot length overflow".into()))?;
+    if bytes.len() != expected {
+        return Err(Error::CorruptStorage("truncated Raft snapshot".into()));
+    }
+    let payload = &bytes[13..13 + length];
+    let stored = u32::from_le_bytes(
+        bytes[13 + length..expected]
+            .try_into()
+            .expect("snapshot checksum is four bytes"),
+    );
+    if crc32c(payload) != stored {
+        return Err(Error::CorruptStorage(
+            "Raft snapshot checksum mismatch".into(),
+        ));
+    }
+    serde_json::from_slice(payload).map_err(|error| Error::CorruptStorage(error.to_string()))
 }
 
 fn should_rebuild_index(index: Option<&HnswIndex>, dirty_count: usize, point_count: usize) -> bool {
@@ -666,9 +804,27 @@ fn read_snapshot(directory: &Path) -> FocalResult<Option<StoredSnapshot>> {
         return Ok(None);
     }
     let bytes = fs::read(path)?;
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(|error| Error::CorruptStorage(error.to_string()))
+    let snapshot: StoredSnapshot =
+        serde_json::from_slice(&bytes).map_err(|error| Error::CorruptStorage(error.to_string()))?;
+    if let Some(stored) = snapshot.checksum {
+        let actual = stored_snapshot_checksum(&snapshot.meta, &snapshot.data)
+            .map_err(|error| Error::CorruptStorage(error.to_string()))?;
+        if stored != actual {
+            return Err(Error::CorruptStorage(
+                "stored Raft snapshot checksum mismatch".into(),
+            ));
+        }
+    }
+    Ok(Some(snapshot))
+}
+
+fn stored_snapshot_checksum(
+    meta: &SnapshotMeta<NodeId, openraft::BasicNode>,
+    data: &[u8],
+) -> std::io::Result<u32> {
+    serde_json::to_vec(&(meta, data))
+        .map(|bytes| crc32c(&bytes))
+        .map_err(invalid_data)
 }
 
 fn invalid_data(error: impl std::error::Error + Send + Sync + 'static) -> std::io::Error {
@@ -693,7 +849,7 @@ mod tests {
 
     use openraft::{CommittedLeaderId, EntryPayload};
 
-    use crate::{Metric, UpsertPoint};
+    use crate::{Filter, Metric, UpsertPoint, Value};
 
     use super::*;
 
@@ -897,6 +1053,81 @@ mod tests {
             state.search(vec![1.0, 0.0], 1, None).await.unwrap()[0].id,
             "bulk-255"
         );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_checksum_rejects_corruption_and_truncation() {
+        let corrupted_directory = directory();
+        let mut state = DurableShardStateMachine::open(&corrupted_directory, config()).unwrap();
+        state.apply([entry(1, 1)]).await.unwrap();
+        state.build_snapshot().await.unwrap();
+        drop(state);
+
+        let path = corrupted_directory.join("state.snapshot");
+        let mut stored: StoredSnapshot = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        stored.data[20] ^= 0x40;
+        fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
+        assert!(matches!(
+            DurableShardStateMachine::open(&corrupted_directory, config()),
+            Err(Error::CorruptStorage(message)) if message.contains("checksum")
+        ));
+        fs::remove_dir_all(corrupted_directory).unwrap();
+
+        let truncated_directory = directory();
+        let mut state = DurableShardStateMachine::open(&truncated_directory, config()).unwrap();
+        state.apply([entry(1, 1)]).await.unwrap();
+        state.build_snapshot().await.unwrap();
+        drop(state);
+        let path = truncated_directory.join("state.snapshot");
+        let bytes = fs::read(&path).unwrap();
+        fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
+        assert!(matches!(
+            DurableShardStateMachine::open(&truncated_directory, config()),
+            Err(Error::CorruptStorage(_))
+        ));
+        fs::remove_dir_all(truncated_directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn broad_filtered_queries_use_index_and_preserve_filter_correctness() {
+        let directory = directory();
+        let mut state = DurableShardStateMachine::open(&directory, config()).unwrap();
+        let points = (0..1_024)
+            .map(|index| UpsertPoint {
+                id: format!("filtered-{index:03}"),
+                vector: vec![index as f32, 1.0],
+                metadata: BTreeMap::from([(
+                    "group".into(),
+                    Value::Keyword(if index % 2 == 0 { "even" } else { "odd" }.into()),
+                )]),
+            })
+            .collect();
+        state
+            .apply([Entry {
+                log_id: LogId::new(CommittedLeaderId::new(1, 1), 1),
+                payload: EntryPayload::Normal(ShardCommand::Upsert {
+                    client_id: "filter-client".into(),
+                    request_id: 1,
+                    points,
+                }),
+            }])
+            .await
+            .unwrap();
+        let filter = Filter::Eq {
+            field: "group".into(),
+            value: Value::Keyword("even".into()),
+        };
+        let hits = state
+            .search_with_ef(vec![1.0, 0.0], 10, Some(&filter), 128)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 10);
+        assert!(
+            hits.iter()
+                .all(|hit| { hit.metadata.get("group") == Some(&Value::Keyword("even".into())) })
+        );
+        assert_eq!(hits[0].id, "filtered-1022");
         fs::remove_dir_all(directory).unwrap();
     }
 }

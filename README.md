@@ -2,8 +2,8 @@
 
 [![Rust](https://img.shields.io/badge/Rust-2024%20edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![Dependencies](https://img.shields.io/badge/Runtime%20dependencies-7-brightgreen.svg)](Cargo.toml)
-[![Tests](https://img.shields.io/badge/Tests-50%20passing-brightgreen.svg)](#try-it)
+[![Dependencies](https://img.shields.io/badge/Runtime%20dependencies-10-brightgreen.svg)](Cargo.toml)
+[![Tests](https://img.shields.io/badge/Tests-53%20passing-brightgreen.svg)](#try-it)
 
 Focal Vector is a low-latency, durable vector database with both single-node
 and replicated, hash-sharded execution paths.
@@ -26,6 +26,8 @@ authenticated peer RPC, membership changes, and leader failover.
 Replicated shard reads use snapshot-backed HNSW plus an exact delta for updates,
 inserts, and deletes made since the graph was built. Large dirty deltas rebuild
 off-lock and publish only if the collection sequence is still current.
+Raft state snapshots and journals carry CRC32C integrity checks and fail closed
+on corruption or truncation.
 
 Durable collections are backed by a versioned, CRC32C-protected write-ahead log.
 Synchronous commits are acknowledged only after `sync_data`, collection
@@ -100,6 +102,10 @@ Request bodies, batch sizes, result counts, and filter nesting are bounded.
 Blocking storage work runs outside Tokio's asynchronous worker threads, and the
 server shuts down gracefully on Ctrl-C.
 
+Set `FOCAL_TLS_CERT` and `FOCAL_TLS_KEY` to serve HTTPS directly. Setting
+`FOCAL_TLS_CLIENT_CA` additionally requires every client to present a certificate
+signed by that CA (mTLS). The same variables work for `focal-raft-node`.
+
 Create and restore an atomic backup:
 
 ```bash
@@ -136,16 +142,20 @@ curl -X POST http://127.0.0.1:8101/v1/raft/initialize \
   -d '{"members":{"1":"127.0.0.1:8101","2":"127.0.0.1:8102","3":"127.0.0.1:8103"}}'
 ```
 
-Peer and administration traffic is authenticated but uses HTTP. Use a private
-network or mutually authenticated TLS proxy between hosts. Peer and coordinator
-addresses may include an explicit `https://` scheme when routed through TLS.
+Peer and administration traffic is token-authenticated. Native TLS uses
+`FOCAL_TLS_CERT` and `FOCAL_TLS_KEY`; add `FOCAL_TLS_CLIENT_CA` to require mTLS.
+Nodes connecting to private-CA HTTPS peers use `FOCAL_TLS_CA` and, for mTLS,
+`FOCAL_TLS_CLIENT_IDENTITY` pointing to a combined client certificate/private-key
+PEM. Peer and coordinator addresses must use an explicit `https://` scheme.
 Node health and readiness are exposed at `/healthz` and `/readyz`; authenticated
 Raft state is available at `/v1/raft/status`.
 
 Applications can construct `DistributedCollection` with one `ReplicaSet` per
 shard. It hashes writes to the correct replicated shard, tries replicas until a
 leader responds, searches shard leaders concurrently, and merges their results
-into a deterministic global top-k.
+into a deterministic global top-k. `search_result_with_ef` can also perform
+explicit stale follower reads and reports the minimum applied Raft index across
+all queried shards.
 
 Consensus purge operations atomically checkpoint the complete log state before
 truncating the append journal, preventing unbounded journal growth. Checkpoints
@@ -164,7 +174,21 @@ The client reports ingest vectors/second and query QPS with p50, p95, and p99
 latency. Configure point count, query count, and top-k through
 `FOCAL_BENCH_POINTS`, `FOCAL_BENCH_QUERIES`, and `FOCAL_BENCH_K`. Set
 `FOCAL_BENCH_EF_SEARCH` to tune HNSW recall versus latency (the default is
-`max(4 * k, 96)`).
+`max(16 * k, 256)`). Replicated graphs use `M=32` and `ef_construction=400` to
+favor recall. `FOCAL_BENCH_CONCURRENCY` controls concurrent clients and
+`FOCAL_BENCH_RECALL_QUERIES` controls exact-reference recall sampling. The
+report includes throughput, p50/p95/p99, recall@k, and the minimum applied index.
+
+A representative million-vector run can be launched against a deployed cluster:
+
+```bash
+FOCAL_BENCH_POINTS=1000000 FOCAL_BENCH_QUERIES=1000 \
+FOCAL_BENCH_CONCURRENCY=32 FOCAL_BENCH_RECALL_QUERIES=20 \
+cargo run --release --bin focal-distributed-bench
+```
+
+Treat results as hardware- and embedding-specific; the repository does not
+claim the 1M-vector SLO until this command is run on the intended deployment.
 
 ```rust
 use std::collections::BTreeMap;
@@ -256,4 +280,4 @@ Targets are hypotheses until measured on representative hardware and data.
 4. ~~HNSW graph with tunable recall/latency and segment persistence.~~
 5. ~~Metadata equality/range indexes and filtered-search planning.~~
 6. ~~Background snapshot compaction and operational metrics.~~
-7. Replication and sharding only after the single-node SLO is repeatable.
+7. ~~Replication and sharding.~~

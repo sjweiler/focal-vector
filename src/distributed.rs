@@ -4,11 +4,19 @@ use serde::Serialize;
 use tokio::task::JoinSet;
 
 use crate::sharding::shard_index;
-use crate::{Error, Filter, Result, SearchHit, ShardCommand, ShardResponse, UpsertPoint};
+use crate::{
+    Error, Filter, Result, SearchHit, ShardCommand, ShardResponse, ShardSearchResult, UpsertPoint,
+};
 
 #[derive(Debug, Clone)]
 pub struct ReplicaSet {
     pub addresses: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DistributedSearchResult {
+    pub hits: Vec<SearchHit>,
+    pub min_applied_index: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -28,6 +36,14 @@ struct QueryRequest<'a> {
 
 impl DistributedCollection {
     pub fn new(shards: Vec<ReplicaSet>, token: impl Into<String>) -> Result<Self> {
+        Self::with_http_client(shards, token, crate::build_http_client(None)?)
+    }
+
+    pub fn with_http_client(
+        shards: Vec<ReplicaSet>,
+        token: impl Into<String>,
+        client: reqwest::Client,
+    ) -> Result<Self> {
         if shards.is_empty() || shards.iter().any(|shard| shard.addresses.is_empty()) {
             return Err(Error::InvalidConfig(
                 "distributed collections require at least one replica per shard",
@@ -38,7 +54,7 @@ impl DistributedCollection {
             return Err(Error::InvalidConfig("Raft peer token must not be empty"));
         }
         Ok(Self {
-            client: reqwest::Client::new(),
+            client,
             token,
             shards,
         })
@@ -142,7 +158,7 @@ impl DistributedCollection {
         k: usize,
         filter: Option<Filter>,
     ) -> Result<Vec<SearchHit>> {
-        self.search_with_ef(vector, k, filter, k.saturating_mul(4).max(96))
+        self.search_with_ef(vector, k, filter, k.saturating_mul(16).max(256))
             .await
     }
 
@@ -153,6 +169,20 @@ impl DistributedCollection {
         filter: Option<Filter>,
         ef_search: usize,
     ) -> Result<Vec<SearchHit>> {
+        Ok(self
+            .search_result_with_ef(vector, k, filter, ef_search, false)
+            .await?
+            .hits)
+    }
+
+    pub async fn search_result_with_ef(
+        &self,
+        vector: Vec<f32>,
+        k: usize,
+        filter: Option<Filter>,
+        ef_search: usize,
+        stale: bool,
+    ) -> Result<DistributedSearchResult> {
         if k == 0 {
             return Err(Error::InvalidQuery("k must be greater than zero"));
         }
@@ -168,7 +198,11 @@ impl DistributedCollection {
                 collection
                     .send_to_leader(
                         shard,
-                        "/v1/raft/query",
+                        if stale {
+                            "/v1/raft/query/stale"
+                        } else {
+                            "/v1/raft/query"
+                        },
                         &QueryRequest {
                             vector: &vector,
                             k,
@@ -180,10 +214,18 @@ impl DistributedCollection {
             });
         }
         let mut hits = Vec::new();
+        let mut min_applied_index = None;
+        let mut all_shards_reported_index = true;
         while let Some(result) = tasks.join_next().await {
-            let shard_hits: Vec<SearchHit> =
+            let shard_result: ShardSearchResult =
                 result.map_err(|error| Error::Concurrency(error.to_string()))??;
-            hits.extend(shard_hits);
+            if let Some(index) = shard_result.applied_index {
+                min_applied_index =
+                    Some(min_applied_index.map_or(index, |current: u64| current.min(index)));
+            } else {
+                all_shards_reported_index = false;
+            }
+            hits.extend(shard_result.hits);
         }
         hits.sort_unstable_by(|left, right| {
             right
@@ -192,7 +234,14 @@ impl DistributedCollection {
                 .then_with(|| left.id.cmp(&right.id))
         });
         hits.truncate(k);
-        Ok(hits)
+        Ok(DistributedSearchResult {
+            hits,
+            min_applied_index: if all_shards_reported_index {
+                min_applied_index
+            } else {
+                None
+            },
+        })
     }
 
     async fn send_to_leader<Req, Response>(
@@ -349,6 +398,12 @@ mod tests {
             hits.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>(),
             [high, low]
         );
+        let stale = collection
+            .search_result_with_ef(vec![1.0, 0.0], 2, None, 96, true)
+            .await
+            .unwrap();
+        assert_eq!(stale.hits.len(), 2);
+        assert!(stale.min_applied_index.is_some());
 
         for node in &nodes {
             node.raft().shutdown().await.unwrap();
