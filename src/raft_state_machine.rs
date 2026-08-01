@@ -439,7 +439,7 @@ fn prepare_payload(
                     .unwrap_or_else(|error| ShardResponse::Rejected {
                         message: error.to_string(),
                     }),
-                (ShardCommand::Delete { ids, .. }, Some(sequence))
+                (ShardCommand::Delete { ids, .. }, Some(_))
                     if ids.is_empty() || ids.iter().any(String::is_empty) =>
                 {
                     ShardResponse::Rejected {
