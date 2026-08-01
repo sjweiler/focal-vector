@@ -1,22 +1,24 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 
+use serde::{Deserialize, Serialize};
+
 use crate::{Error, Filter, Metric, Result, Value};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CollectionConfig {
     pub dimension: usize,
     pub metric: Metric,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UpsertPoint {
     pub id: String,
     pub vector: Vec<f32>,
     pub metadata: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Point {
     pub id: String,
     pub vector: Vec<f32>,
@@ -24,7 +26,7 @@ pub struct Point {
     pub sequence: u64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SearchHit {
     pub id: String,
     /// A metric-independent score where larger is better.

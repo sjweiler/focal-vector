@@ -7,6 +7,7 @@ pub enum Error {
     InvalidDimension { expected: usize, actual: usize },
     InvalidVector(&'static str),
     InvalidConfig(&'static str),
+    InvalidConfiguration(String),
     InvalidQuery(&'static str),
     Io(String),
     CorruptStorage(String),
@@ -29,6 +30,7 @@ impl Display for Error {
             }
             Self::InvalidVector(message) => write!(f, "invalid vector: {message}"),
             Self::InvalidConfig(message) => write!(f, "invalid collection config: {message}"),
+            Self::InvalidConfiguration(message) => write!(f, "invalid configuration: {message}"),
             Self::InvalidQuery(message) => write!(f, "invalid query: {message}"),
             Self::Io(message) => write!(f, "storage I/O error: {message}"),
             Self::CorruptStorage(message) => write!(f, "corrupt storage: {message}"),

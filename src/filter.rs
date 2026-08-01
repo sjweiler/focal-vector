@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, PartialEq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Value {
     Keyword(String),
     Integer(i64),
@@ -8,7 +10,7 @@ pub enum Value {
     Boolean(bool),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Filter {
     MatchAll,
     Eq {

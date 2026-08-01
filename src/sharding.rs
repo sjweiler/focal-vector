@@ -61,7 +61,7 @@ impl ShardedCollection {
     }
 
     pub fn shard_for_id(&self, id: &str) -> usize {
-        stable_hash(id.as_bytes()) as usize % self.shards.len()
+        shard_index(id, self.shards.len())
     }
 
     /// Applies one atomic batch per involved shard.
@@ -199,6 +199,11 @@ impl ShardedCollection {
 fn validate_points(config: CollectionConfig, points: &[UpsertPoint]) -> Result<()> {
     let mut validator = Collection::new(config)?;
     validator.upsert(points.to_vec()).map(|_| ())
+}
+
+pub fn shard_index(id: &str, shard_count: usize) -> usize {
+    assert!(shard_count > 0, "shard count must be positive");
+    stable_hash(id.as_bytes()) as usize % shard_count
 }
 
 fn stable_hash(bytes: &[u8]) -> u64 {

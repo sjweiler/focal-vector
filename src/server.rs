@@ -429,6 +429,7 @@ impl IntoResponse for ApiError {
             Error::InvalidDimension { .. }
             | Error::InvalidVector(_)
             | Error::InvalidConfig(_)
+            | Error::InvalidConfiguration(_)
             | Error::InvalidQuery(_) => StatusCode::BAD_REQUEST,
             Error::NotFound(_) => StatusCode::NOT_FOUND,
             Error::AlreadyExists(_) => StatusCode::CONFLICT,

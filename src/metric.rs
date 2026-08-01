@@ -1,6 +1,8 @@
+use serde::{Deserialize, Serialize};
+
 use crate::{Error, Result};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Metric {
     Cosine,
     DotProduct,

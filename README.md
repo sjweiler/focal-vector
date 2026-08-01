@@ -2,8 +2,8 @@
 
 [![Rust](https://img.shields.io/badge/Rust-2024%20edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![Dependencies](https://img.shields.io/badge/Runtime%20dependencies-5-brightgreen.svg)](Cargo.toml)
-[![Tests](https://img.shields.io/badge/Tests-39%20passing-brightgreen.svg)](#try-it)
+[![Dependencies](https://img.shields.io/badge/Runtime%20dependencies-7-brightgreen.svg)](Cargo.toml)
+[![Tests](https://img.shields.io/badge/Tests-46%20passing-brightgreen.svg)](#try-it)
 
 Focal Vector is a design for a low-latency, durable vector database. The first
 release is deliberately single-node: it optimizes the data path before adding
@@ -19,6 +19,11 @@ The library also provides static hash sharding through `ShardedCollection`:
 point IDs route deterministically with FNV-1a, shard searches run concurrently,
 and shard-local results merge into a deterministic global top-k. Shard count is
 a storage contract; changing it requires an explicit data migration.
+
+Distributed replication uses OpenRaft with durable CRC32C journals for consensus
+and applied vector commands. It supports majority-committed writes, durable
+request deduplication, linearizable leader reads, snapshot installation,
+authenticated peer RPC, membership changes, and leader failover.
 
 Durable collections are backed by a versioned, CRC32C-protected write-ahead log.
 Synchronous commits are acknowledged only after `sync_data`, collection
@@ -108,6 +113,34 @@ curl -X POST \
 Backups are written under `<data-dir>/.backups` through a synced temporary
 directory and atomic rename. They include the immutable segment and any WAL
 delta captured under a consistent collection read lock.
+
+## Run a replicated shard
+
+Start one `focal-raft-node` process per voter with a stable node ID, data
+directory, advertised bind address, collection dimension, and shared peer token:
+
+```bash
+FOCAL_NODE_ID=1 FOCAL_DATA_DIR=./cluster/node-1 \
+FOCAL_BIND=127.0.0.1:8101 FOCAL_DIMENSION=768 \
+FOCAL_RAFT_TOKEN=change-me cargo run --release --bin focal-raft-node
+```
+
+After all initial voters are listening, initialize the cluster exactly once on
+node 1:
+
+```bash
+curl -X POST http://127.0.0.1:8101/v1/raft/initialize \
+  -H 'x-focal-raft-token: change-me' -H 'content-type: application/json' \
+  -d '{"members":{"1":"127.0.0.1:8101","2":"127.0.0.1:8102","3":"127.0.0.1:8103"}}'
+```
+
+Peer and administration traffic is authenticated but uses HTTP. Use a private
+network or mutually authenticated TLS proxy between hosts.
+
+Applications can construct `DistributedCollection` with one `ReplicaSet` per
+shard. It hashes writes to the correct replicated shard, tries replicas until a
+leader responds, searches shard leaders concurrently, and merges their results
+into a deterministic global top-k.
 
 ```rust
 use std::collections::BTreeMap;
