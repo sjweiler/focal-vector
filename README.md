@@ -3,11 +3,10 @@
 [![Rust](https://img.shields.io/badge/Rust-2024%20edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Dependencies](https://img.shields.io/badge/Runtime%20dependencies-7-brightgreen.svg)](Cargo.toml)
-[![Tests](https://img.shields.io/badge/Tests-47%20passing-brightgreen.svg)](#try-it)
+[![Tests](https://img.shields.io/badge/Tests-50%20passing-brightgreen.svg)](#try-it)
 
-Focal Vector is a design for a low-latency, durable vector database. The first
-release is deliberately single-node: it optimizes the data path before adding
-distributed coordination.
+Focal Vector is a low-latency, durable vector database with both single-node
+and replicated, hash-sharded execution paths.
 
 The proposed architecture, data model, APIs, indexing strategy, and delivery
 plan are documented in [DESIGN.md](DESIGN.md).
@@ -24,6 +23,9 @@ Distributed replication uses OpenRaft with durable CRC32C journals for consensus
 and applied vector commands. It supports majority-committed writes, durable
 request deduplication, linearizable leader reads, snapshot installation,
 authenticated peer RPC, membership changes, and leader failover.
+Replicated shard reads use snapshot-backed HNSW plus an exact delta for updates,
+inserts, and deletes made since the graph was built. Large dirty deltas rebuild
+off-lock and publish only if the collection sequence is still current.
 
 Durable collections are backed by a versioned, CRC32C-protected write-ahead log.
 Synchronous commits are acknowledged only after `sync_data`, collection
@@ -160,7 +162,9 @@ cargo run --release --bin focal-distributed-bench
 
 The client reports ingest vectors/second and query QPS with p50, p95, and p99
 latency. Configure point count, query count, and top-k through
-`FOCAL_BENCH_POINTS`, `FOCAL_BENCH_QUERIES`, and `FOCAL_BENCH_K`.
+`FOCAL_BENCH_POINTS`, `FOCAL_BENCH_QUERIES`, and `FOCAL_BENCH_K`. Set
+`FOCAL_BENCH_EF_SEARCH` to tune HNSW recall versus latency (the default is
+`max(4 * k, 96)`).
 
 ```rust
 use std::collections::BTreeMap;

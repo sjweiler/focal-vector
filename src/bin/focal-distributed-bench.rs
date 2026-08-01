@@ -60,7 +60,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let point_count = number("FOCAL_BENCH_POINTS", 10_000)?;
     let query_count = number("FOCAL_BENCH_QUERIES", 100)?;
     let k = number("FOCAL_BENCH_K", 10)?;
-    if dimension == 0 || point_count == 0 || query_count == 0 || k == 0 {
+    let ef_search = number("FOCAL_BENCH_EF_SEARCH", k.saturating_mul(4).max(96))?;
+    if dimension == 0 || point_count == 0 || query_count == 0 || k == 0 || ef_search < k {
         return Err("benchmark dimensions and counts must be positive".into());
     }
 
@@ -84,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for index in 0..query_count {
         let query = vector(point_count as u64 + index as u64 + 1, dimension);
         let started = Instant::now();
-        let hits = collection.search(query, k, None).await?;
+        let hits = collection.search_with_ef(query, k, None, ef_search).await?;
         if hits.is_empty() {
             return Err("query unexpectedly returned no results".into());
         }
@@ -94,7 +95,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     latencies.sort_unstable();
 
     println!("shards={}", collection.shard_count());
-    println!("points={point_count} dimension={dimension} queries={query_count} k={k}");
+    println!(
+        "points={point_count} dimension={dimension} queries={query_count} k={k} ef_search={ef_search}"
+    );
     println!(
         "ingest_seconds={:.3} ingest_vectors_per_second={:.1}",
         ingest_elapsed.as_secs_f64(),

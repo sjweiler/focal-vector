@@ -31,6 +31,11 @@ and merges shard-local results into a deterministic global top-k.
 ## Reads and queries
 
 - Linearizable reads confirm leadership with a quorum before reading a shard.
+- Unfiltered reads query HNSW for the stable graph and exact-search the changed
+  ID delta; `ef_search` controls the recall/latency tradeoff.
+- Graph rebuilds occur after a bulk load or when the changed delta reaches 20%
+  of the live collection (with a 256-ID minimum).
+- Metadata-filtered reads remain exact to preserve filter correctness.
 - Explicit stale reads may query followers at a reported applied index.
 - The coordinator requests top-k from every shard, merges by descending score
   and ascending point ID, and reports the minimum applied index.

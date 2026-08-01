@@ -277,6 +277,17 @@ impl RaftNode {
         k: usize,
         filter: Option<&Filter>,
     ) -> Result<Vec<SearchHit>> {
+        self.search_with_ef(query, k, filter, k.saturating_mul(4).max(96))
+            .await
+    }
+
+    pub async fn search_with_ef(
+        &self,
+        query: Vec<f32>,
+        k: usize,
+        filter: Option<&Filter>,
+        ef_search: usize,
+    ) -> Result<Vec<SearchHit>> {
         let _permit =
             self.network.admission.try_acquire().map_err(|_| {
                 Error::ResourceExhausted("Raft client operation limit reached".into())
@@ -285,7 +296,9 @@ impl RaftNode {
             .ensure_linearizable()
             .await
             .map_err(|error| Error::Concurrency(error.to_string()))?;
-        self.state_machine.search(query, k, filter).await
+        self.state_machine
+            .search_with_ef(query, k, filter, ef_search)
+            .await
     }
 
     pub async fn local_len(&self) -> usize {
@@ -346,6 +359,7 @@ struct QueryRequest {
     vector: Vec<f32>,
     k: usize,
     filter: Option<Filter>,
+    ef_search: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -421,10 +435,17 @@ async fn linearizable_query(
     if !authorized(&headers, &node.token) {
         return Err(unauthorized());
     }
-    node.search(request.vector, request.k, request.filter.as_ref())
-        .await
-        .map(Json)
-        .map_err(api_error)
+    node.search_with_ef(
+        request.vector,
+        request.k,
+        request.filter.as_ref(),
+        request
+            .ef_search
+            .unwrap_or_else(|| request.k.saturating_mul(4).max(96)),
+    )
+    .await
+    .map(Json)
+    .map_err(api_error)
 }
 
 async fn add_learner(

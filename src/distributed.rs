@@ -23,6 +23,7 @@ struct QueryRequest<'a> {
     vector: &'a [f32],
     k: usize,
     filter: Option<&'a Filter>,
+    ef_search: usize,
 }
 
 impl DistributedCollection {
@@ -141,8 +142,22 @@ impl DistributedCollection {
         k: usize,
         filter: Option<Filter>,
     ) -> Result<Vec<SearchHit>> {
+        self.search_with_ef(vector, k, filter, k.saturating_mul(4).max(96))
+            .await
+    }
+
+    pub async fn search_with_ef(
+        &self,
+        vector: Vec<f32>,
+        k: usize,
+        filter: Option<Filter>,
+        ef_search: usize,
+    ) -> Result<Vec<SearchHit>> {
         if k == 0 {
             return Err(Error::InvalidQuery("k must be greater than zero"));
+        }
+        if ef_search < k {
+            return Err(Error::InvalidQuery("ef_search must be at least k"));
         }
         let mut tasks = JoinSet::new();
         for shard in 0..self.shards.len() {
@@ -158,6 +173,7 @@ impl DistributedCollection {
                             vector: &vector,
                             k,
                             filter: filter.as_ref(),
+                            ef_search,
                         },
                     )
                     .await
