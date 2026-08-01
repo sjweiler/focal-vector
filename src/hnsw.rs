@@ -1,6 +1,9 @@
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashSet};
+use std::io::Write;
+use std::sync::{Arc, Mutex};
 
+use memmap2::Mmap;
 use rayon::prelude::*;
 
 use crate::{Error, Metric, Result};
@@ -8,8 +11,28 @@ use crate::{Error, Metric, Result};
 const MAX_LEVEL: usize = 32;
 const PARALLEL_BUILD_SEED: usize = 4_096;
 const PARALLEL_BUILD_BATCH: usize = 512;
+const MAX_POOLED_SEARCH_WORKSPACES: usize = 8;
 const GRAPH_MAGIC: &[u8; 4] = b"FVHG";
-const GRAPH_VERSION: u8 = 1;
+const GRAPH_VERSION: u8 = 2;
+const LEGACY_GRAPH_VERSION: u8 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HnswVectorStorage {
+    F32,
+    ScalarInt8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HnswStats {
+    pub nodes: usize,
+    pub layers: usize,
+    pub links: usize,
+    pub id_bytes: usize,
+    /// Heap bytes used by vector components and their lookup metadata. Mapped
+    /// code pages are deliberately excluded because residency is OS-managed.
+    pub vector_heap_bytes: usize,
+    pub vectors_memory_mapped: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HnswConfig {
@@ -38,14 +61,228 @@ pub struct HnswHit {
 
 #[derive(Debug, Clone)]
 struct Node {
-    id: String,
-    neighbors: Vec<Vec<usize>>,
+    level: u8,
+    range_start: u32,
+    neighbors: Vec<Vec<u32>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LinkRange {
+    start: u32,
+    end: u32,
+}
+
+#[derive(Debug, Clone)]
+struct CompactGraph {
+    ranges: Vec<LinkRange>,
+    links: Vec<u32>,
 }
 
 struct PreparedPoint {
     id: String,
-    vector: Vec<f32>,
+    vector: PreparedVector,
     level: usize,
+}
+
+enum PreparedVector {
+    F32(Vec<f32>),
+    ScalarInt8(QuantizedVector),
+}
+
+impl PreparedVector {
+    fn new(vector: Vec<f32>, storage: HnswVectorStorage) -> Self {
+        match storage {
+            HnswVectorStorage::F32 => Self::F32(vector),
+            HnswVectorStorage::ScalarInt8 => Self::ScalarInt8(QuantizedVector::new(&vector)),
+        }
+    }
+
+    fn as_ref(&self) -> VectorRef<'_> {
+        match self {
+            Self::F32(vector) => VectorRef::F32(vector),
+            Self::ScalarInt8(vector) => vector.as_ref(),
+        }
+    }
+}
+
+struct QuantizedVector {
+    codes: Vec<i8>,
+    scale: f32,
+    squared_norm: f32,
+}
+
+impl QuantizedVector {
+    fn new(vector: &[f32]) -> Self {
+        let max_abs = vector
+            .iter()
+            .fold(0.0_f32, |maximum, value| maximum.max(value.abs()));
+        let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
+        let codes: Vec<i8> = vector
+            .iter()
+            .map(|value| (value / scale).round().clamp(-127.0, 127.0) as i8)
+            .collect();
+        let squared_norm = quantized_squared_norm(&codes, scale);
+        Self {
+            codes,
+            scale,
+            squared_norm,
+        }
+    }
+
+    fn as_ref(&self) -> VectorRef<'_> {
+        VectorRef::ScalarInt8 {
+            codes: &self.codes,
+            scale: self.scale,
+            squared_norm: self.squared_norm,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum VectorRef<'a> {
+    F32(&'a [f32]),
+    ScalarInt8 {
+        codes: &'a [i8],
+        scale: f32,
+        squared_norm: f32,
+    },
+}
+
+#[derive(Debug, Clone)]
+enum VectorArena {
+    F32(Vec<f32>),
+    ScalarInt8 {
+        codes: Vec<i8>,
+        scales: Vec<f32>,
+        squared_norms: Vec<f32>,
+    },
+    MappedScalarInt8 {
+        bytes: Arc<Mmap>,
+        offsets: Vec<u64>,
+        scales: Vec<f32>,
+        squared_norms: Vec<f32>,
+    },
+}
+
+impl VectorArena {
+    fn with_capacity(storage: HnswVectorStorage, vectors: usize, dimension: usize) -> Self {
+        let components = vectors.saturating_mul(dimension);
+        match storage {
+            HnswVectorStorage::F32 => Self::F32(Vec::with_capacity(components)),
+            HnswVectorStorage::ScalarInt8 => Self::ScalarInt8 {
+                codes: Vec::with_capacity(components),
+                scales: Vec::with_capacity(vectors),
+                squared_norms: Vec::with_capacity(vectors),
+            },
+        }
+    }
+
+    fn storage(&self) -> HnswVectorStorage {
+        match self {
+            Self::F32(_) => HnswVectorStorage::F32,
+            Self::ScalarInt8 { .. } | Self::MappedScalarInt8 { .. } => {
+                HnswVectorStorage::ScalarInt8
+            }
+        }
+    }
+
+    fn push(&mut self, vector: PreparedVector) {
+        match (self, vector) {
+            (Self::F32(arena), PreparedVector::F32(vector)) => arena.extend_from_slice(&vector),
+            (
+                Self::ScalarInt8 {
+                    codes,
+                    scales,
+                    squared_norms,
+                },
+                PreparedVector::ScalarInt8(vector),
+            ) => {
+                codes.extend_from_slice(&vector.codes);
+                scales.push(vector.scale);
+                squared_norms.push(vector.squared_norm);
+            }
+            _ => unreachable!("prepared vectors match their HNSW arena"),
+        }
+    }
+
+    fn push_mapped(&mut self, offset: usize, scale: f32, squared_norm: f32) -> Result<()> {
+        let Self::MappedScalarInt8 {
+            offsets,
+            scales,
+            squared_norms,
+            ..
+        } = self
+        else {
+            return Err(Error::CorruptStorage(
+                "mapped vector was decoded into an owned arena".into(),
+            ));
+        };
+        offsets.push(u64::try_from(offset).map_err(|_| {
+            Error::CorruptStorage("mapped vector offset exceeds u64 address space".into())
+        })?);
+        scales.push(scale);
+        squared_norms.push(squared_norm);
+        Ok(())
+    }
+
+    fn get(&self, node: usize, dimension: usize) -> VectorRef<'_> {
+        let start = node * dimension;
+        match self {
+            Self::F32(vectors) => VectorRef::F32(&vectors[start..start + dimension]),
+            Self::ScalarInt8 {
+                codes,
+                scales,
+                squared_norms,
+            } => VectorRef::ScalarInt8 {
+                codes: &codes[start..start + dimension],
+                scale: scales[node],
+                squared_norm: squared_norms[node],
+            },
+            Self::MappedScalarInt8 {
+                bytes,
+                offsets,
+                scales,
+                squared_norms,
+            } => {
+                let start = offsets[node] as usize;
+                let bytes = &bytes[start..start + dimension];
+                // SAFETY: i8 and u8 have identical size/alignment and every bit
+                // pattern is valid. The returned slice cannot outlive the map.
+                let codes =
+                    unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<i8>(), bytes.len()) };
+                VectorRef::ScalarInt8 {
+                    codes,
+                    scale: scales[node],
+                    squared_norm: squared_norms[node],
+                }
+            }
+        }
+    }
+
+    fn component_bytes(&self) -> usize {
+        match self {
+            Self::F32(vectors) => vectors.len() * size_of::<f32>(),
+            Self::ScalarInt8 {
+                codes,
+                scales,
+                squared_norms,
+            } => {
+                codes.len() * size_of::<i8>()
+                    + scales.len() * size_of::<f32>()
+                    + squared_norms.len() * size_of::<f32>()
+            }
+            Self::MappedScalarInt8 {
+                offsets,
+                scales,
+                squared_norms,
+                ..
+            } => {
+                offsets.len() * size_of::<u64>()
+                    + scales.len() * size_of::<f32>()
+                    + squared_norms.len() * size_of::<f32>()
+            }
+        }
+    }
 }
 
 struct InsertionPlan {
@@ -58,13 +295,47 @@ pub struct HnswIndex {
     metric: Metric,
     config: HnswConfig,
     nodes: Vec<Node>,
-    vectors: Vec<f32>,
+    ids: Vec<Box<str>>,
+    vectors: VectorArena,
     entry_point: Option<usize>,
     max_level: usize,
+    search_workspaces: Arc<Mutex<Vec<BuildWorkspace>>>,
+    compact_graph: Option<CompactGraph>,
 }
 
 impl HnswIndex {
     pub fn build<I>(dimension: usize, metric: Metric, config: HnswConfig, points: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = (String, Vec<f32>)>,
+    {
+        Self::build_with_storage(dimension, metric, config, HnswVectorStorage::F32, points)
+    }
+
+    pub fn build_quantized<I>(
+        dimension: usize,
+        metric: Metric,
+        config: HnswConfig,
+        points: I,
+    ) -> Result<Self>
+    where
+        I: IntoIterator<Item = (String, Vec<f32>)>,
+    {
+        Self::build_with_storage(
+            dimension,
+            metric,
+            config,
+            HnswVectorStorage::ScalarInt8,
+            points,
+        )
+    }
+
+    pub fn build_with_storage<I>(
+        dimension: usize,
+        metric: Metric,
+        config: HnswConfig,
+        storage: HnswVectorStorage,
+        points: I,
+    ) -> Result<Self>
     where
         I: IntoIterator<Item = (String, Vec<f32>)>,
     {
@@ -90,7 +361,7 @@ impl HnswIndex {
                         actual: vector.len(),
                     });
                 }
-                let vector = metric.prepare(vector)?;
+                let vector = PreparedVector::new(metric.prepare(vector)?, storage);
                 Ok(PreparedPoint {
                     level: deterministic_level(&id, config.m),
                     id,
@@ -98,14 +369,75 @@ impl HnswIndex {
                 })
             })
             .collect::<Result<_>>()?;
+        Self::build_prepared_points(dimension, metric, config, storage, prepared)
+    }
+
+    pub(crate) fn build_quantized_prepared<'a, I>(
+        dimension: usize,
+        metric: Metric,
+        config: HnswConfig,
+        points: I,
+    ) -> Result<Self>
+    where
+        I: IntoIterator<Item = (String, &'a [f32])>,
+    {
+        validate_config(dimension, config)?;
+        let points: Vec<_> = points.into_iter().collect();
+        let capacity = points.len();
+        let mut ids = HashSet::with_capacity(capacity);
+        for (id, vector) in &points {
+            if id.is_empty() {
+                return Err(Error::InvalidQuery("point ID must not be empty"));
+            }
+            if !ids.insert(id.as_str()) {
+                return Err(Error::InvalidQuery("HNSW point IDs must be unique"));
+            }
+            if vector.len() != dimension {
+                return Err(Error::InvalidDimension {
+                    expected: dimension,
+                    actual: vector.len(),
+                });
+            }
+            if vector.iter().any(|value| !value.is_finite()) {
+                return Err(Error::InvalidVector("components must be finite"));
+            }
+        }
+        let prepared = points
+            .into_par_iter()
+            .map(|(id, vector)| PreparedPoint {
+                level: deterministic_level(&id, config.m),
+                id,
+                vector: PreparedVector::ScalarInt8(QuantizedVector::new(vector)),
+            })
+            .collect();
+        Self::build_prepared_points(
+            dimension,
+            metric,
+            config,
+            HnswVectorStorage::ScalarInt8,
+            prepared,
+        )
+    }
+
+    fn build_prepared_points(
+        dimension: usize,
+        metric: Metric,
+        config: HnswConfig,
+        storage: HnswVectorStorage,
+        prepared: Vec<PreparedPoint>,
+    ) -> Result<Self> {
+        let capacity = prepared.len();
         let mut index = Self {
             dimension,
             metric,
             config,
             nodes: Vec::with_capacity(capacity),
-            vectors: Vec::with_capacity(capacity.saturating_mul(dimension)),
+            ids: Vec::with_capacity(capacity),
+            vectors: VectorArena::with_capacity(storage, capacity, dimension),
             entry_point: None,
             max_level: 0,
+            search_workspaces: Arc::new(Mutex::new(Vec::new())),
+            compact_graph: None,
         };
         let mut workspace = BuildWorkspace::with_capacity(capacity);
         let mut prepared = prepared.into_iter();
@@ -139,6 +471,7 @@ impl HnswIndex {
             }
         }
         index.compact_neighbors();
+        index.finalize_compact_graph()?;
         Ok(index)
     }
 
@@ -162,8 +495,38 @@ impl HnswIndex {
         self.config
     }
 
+    pub fn vector_storage(&self) -> HnswVectorStorage {
+        self.vectors.storage()
+    }
+
+    pub fn vector_storage_bytes(&self) -> usize {
+        self.vectors.component_bytes()
+    }
+
+    /// Returns true when quantized vector codes are read directly from an
+    /// immutable segment mapping instead of a copied heap arena.
+    pub fn vectors_are_memory_mapped(&self) -> bool {
+        matches!(self.vectors, VectorArena::MappedScalarInt8 { .. })
+    }
+
+    pub fn stats(&self) -> HnswStats {
+        let (layers, links) = self
+            .compact_graph
+            .as_ref()
+            .map(|graph| (graph.ranges.len(), graph.links.len()))
+            .unwrap_or_default();
+        HnswStats {
+            nodes: self.nodes.len(),
+            layers,
+            links,
+            id_bytes: self.ids.iter().map(|id| id.len()).sum(),
+            vector_heap_bytes: self.vectors.component_bytes(),
+            vectors_memory_mapped: self.vectors_are_memory_mapped(),
+        }
+    }
+
     pub(crate) fn ids(&self) -> impl Iterator<Item = &str> {
-        self.nodes.iter().map(|node| node.id.as_str())
+        self.ids.iter().map(AsRef::as_ref)
     }
 
     pub fn search(&self, query: Vec<f32>, k: usize, ef_search: usize) -> Result<Vec<HnswHit>> {
@@ -179,67 +542,146 @@ impl HnswIndex {
                 actual: query.len(),
             });
         }
-        let query = self.metric.prepare(query)?;
+        let query = PreparedVector::new(self.metric.prepare(query)?, self.vector_storage());
+        let query = query.as_ref();
         let Some(mut current) = self.entry_point else {
             return Ok(Vec::new());
         };
 
         for layer in (1..=self.max_level).rev() {
-            current = self.greedy_closest(&query, current, layer);
+            current = self.greedy_closest(query, current, layer);
         }
-        let mut candidates = self.search_layer(&query, current, ef_search, 0);
+        let mut workspace = self.take_search_workspace();
+        let mut candidates = self.search_layer(query, current, ef_search, 0, &mut workspace);
+        self.return_search_workspace(workspace);
         candidates.truncate(k);
         Ok(candidates
             .into_iter()
             .map(|item| HnswHit {
-                id: self.nodes[item.index].id.clone(),
+                id: self.ids[item.index].to_string(),
                 score: item.score,
             })
             .collect())
     }
 
+    #[cfg(test)]
     pub(crate) fn encode(&self) -> Result<Vec<u8>> {
-        let mut output = Vec::new();
-        output.extend_from_slice(GRAPH_MAGIC);
-        output.push(GRAPH_VERSION);
-        output.extend_from_slice(&(self.dimension as u64).to_le_bytes());
-        output.push(metric_tag(self.metric));
-        put_u32(&mut output, self.config.m)?;
-        put_u32(&mut output, self.config.ef_construction)?;
-        put_u32(&mut output, self.nodes.len())?;
-        output.extend_from_slice(
+        let mut output = Vec::with_capacity(self.encoded_len()?);
+        self.encode_into(&mut output)?;
+        Ok(output)
+    }
+
+    pub(crate) fn encoded_len(&self) -> Result<usize> {
+        let vector_bytes = match self.vector_storage() {
+            HnswVectorStorage::F32 => self
+                .dimension
+                .checked_mul(size_of::<f32>())
+                .ok_or_else(|| Error::ResourceExhausted("HNSW encoded size overflows".into()))?,
+            HnswVectorStorage::ScalarInt8 => self
+                .dimension
+                .checked_add(size_of::<f32>())
+                .ok_or_else(|| Error::ResourceExhausted("HNSW encoded size overflows".into()))?,
+        };
+        let mut length = 39_usize;
+        for (node_index, id) in self.ids.iter().enumerate() {
+            length = length
+                .checked_add(4)
+                .and_then(|length| length.checked_add(id.len()))
+                .and_then(|length| length.checked_add(vector_bytes))
+                .and_then(|length| length.checked_add(4))
+                .ok_or_else(|| Error::ResourceExhausted("HNSW encoded size overflows".into()))?;
+            for layer in 0..=usize::from(self.nodes[node_index].level) {
+                length = length
+                    .checked_add(4)
+                    .and_then(|length| {
+                        length.checked_add(self.neighbors(node_index, layer).len().checked_mul(4)?)
+                    })
+                    .ok_or_else(|| {
+                        Error::ResourceExhausted("HNSW encoded size overflows".into())
+                    })?;
+            }
+        }
+        Ok(length)
+    }
+
+    pub(crate) fn encode_into(&self, output: &mut impl Write) -> Result<()> {
+        output.write_all(GRAPH_MAGIC)?;
+        output.write_all(&[GRAPH_VERSION])?;
+        output.write_all(&(self.dimension as u64).to_le_bytes())?;
+        output.write_all(&[metric_tag(self.metric)])?;
+        output.write_all(&[storage_tag(self.vector_storage())])?;
+        put_u32_writer(output, self.config.m)?;
+        put_u32_writer(output, self.config.ef_construction)?;
+        put_u32_writer(output, self.nodes.len())?;
+        output.write_all(
             &self
                 .entry_point
                 .map(|value| value as u64)
                 .unwrap_or(u64::MAX)
                 .to_le_bytes(),
-        );
-        put_u32(&mut output, self.max_level)?;
+        )?;
+        put_u32_writer(output, self.max_level)?;
         for (node_index, node) in self.nodes.iter().enumerate() {
-            put_bytes(&mut output, node.id.as_bytes())?;
-            for value in self.vector(node_index) {
-                output.extend_from_slice(&value.to_le_bytes());
+            put_bytes_writer(output, self.ids[node_index].as_bytes())?;
+            match self.vector(node_index) {
+                VectorRef::F32(vector) => {
+                    for value in vector {
+                        output.write_all(&value.to_le_bytes())?;
+                    }
+                }
+                VectorRef::ScalarInt8 {
+                    codes,
+                    scale,
+                    squared_norm: _,
+                } => {
+                    output.write_all(&scale.to_le_bytes())?;
+                    for code in codes {
+                        output.write_all(&code.to_le_bytes())?;
+                    }
+                }
             }
-            put_u32(&mut output, node.neighbors.len())?;
-            for layer in &node.neighbors {
-                put_u32(&mut output, layer.len())?;
+            put_u32_writer(output, usize::from(node.level) + 1)?;
+            for layer_index in 0..=usize::from(node.level) {
+                let layer = self.neighbors(node_index, layer_index);
+                put_u32_writer(output, layer.len())?;
                 for &neighbor in layer {
-                    put_u32(&mut output, neighbor)?;
+                    put_u32_writer(output, neighbor as usize)?;
                 }
             }
         }
-        Ok(output)
+        Ok(())
     }
 
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
+        Self::decode_inner(bytes, None)
+    }
+
+    pub(crate) fn decode_mapped(
+        bytes: &[u8],
+        mapping: Arc<Mmap>,
+        mapping_offset: usize,
+    ) -> Result<Self> {
+        Self::decode_inner(bytes, Some((mapping, mapping_offset)))
+    }
+
+    fn decode_inner(bytes: &[u8], mapping: Option<(Arc<Mmap>, usize)>) -> Result<Self> {
         let mut decoder = GraphDecoder::new(bytes);
-        if decoder.take(4)? != GRAPH_MAGIC || decoder.byte()? != GRAPH_VERSION {
+        if decoder.take(4)? != GRAPH_MAGIC {
+            return Err(Error::CorruptStorage("invalid HNSW graph header".into()));
+        }
+        let version = decoder.byte()?;
+        if version != LEGACY_GRAPH_VERSION && version != GRAPH_VERSION {
             return Err(Error::CorruptStorage("invalid HNSW graph header".into()));
         }
         let dimension_u64 = decoder.u64()?;
         let dimension = usize::try_from(dimension_u64)
             .map_err(|_| Error::CorruptStorage("HNSW dimension is too large".into()))?;
         let metric = parse_metric(decoder.byte()?)?;
+        let storage = if version == LEGACY_GRAPH_VERSION {
+            HnswVectorStorage::F32
+        } else {
+            parse_storage(decoder.byte()?)?
+        };
         let config = HnswConfig {
             m: decoder.usize()?,
             ef_construction: decoder.usize()?,
@@ -267,26 +709,74 @@ impl HnswIndex {
         }
 
         let mut nodes = Vec::with_capacity(node_count);
-        let vector_capacity = node_count.checked_mul(dimension).ok_or_else(|| {
+        node_count.checked_mul(dimension).ok_or_else(|| {
             Error::CorruptStorage("HNSW vector storage size overflows address space".into())
         })?;
-        let mut vectors = Vec::with_capacity(vector_capacity);
-        let mut ids = HashSet::with_capacity(node_count);
+        let mut vectors = match (&mapping, storage) {
+            (Some((mapping, _)), HnswVectorStorage::ScalarInt8) => VectorArena::MappedScalarInt8 {
+                bytes: Arc::clone(mapping),
+                offsets: Vec::with_capacity(node_count),
+                scales: Vec::with_capacity(node_count),
+                squared_norms: Vec::with_capacity(node_count),
+            },
+            _ => VectorArena::with_capacity(storage, node_count, dimension),
+        };
+        let mut seen_ids = HashSet::with_capacity(node_count);
+        let mut ids = Vec::with_capacity(node_count);
         for _ in 0..node_count {
             let id = decoder.string()?;
-            if id.is_empty() || !ids.insert(id.clone()) {
+            if id.is_empty() || !seen_ids.insert(id.clone()) {
                 return Err(Error::CorruptStorage(
                     "HNSW graph contains an empty or duplicate ID".into(),
                 ));
             }
-            for _ in 0..dimension {
-                let value = decoder.f32()?;
-                if !value.is_finite() {
-                    return Err(Error::CorruptStorage(
-                        "HNSW graph contains a non-finite vector".into(),
-                    ));
+            let vector = match storage {
+                HnswVectorStorage::F32 => {
+                    let mut vector = Vec::with_capacity(dimension);
+                    for _ in 0..dimension {
+                        let value = decoder.f32()?;
+                        if !value.is_finite() {
+                            return Err(Error::CorruptStorage(
+                                "HNSW graph contains a non-finite vector".into(),
+                            ));
+                        }
+                        vector.push(value);
+                    }
+                    PreparedVector::F32(vector)
                 }
-                vectors.push(value);
+                HnswVectorStorage::ScalarInt8 => {
+                    let scale = decoder.f32()?;
+                    if !scale.is_finite() || scale <= 0.0 {
+                        return Err(Error::CorruptStorage(
+                            "HNSW graph contains invalid quantization parameters".into(),
+                        ));
+                    }
+                    let code_position = decoder.position();
+                    let code_bytes = decoder.take(dimension)?;
+                    if let Some((_, mapping_offset)) = &mapping {
+                        let squared_norm = quantized_squared_norm_bytes(code_bytes, scale);
+                        vectors.push_mapped(mapping_offset + code_position, scale, squared_norm)?;
+                        PreparedVector::ScalarInt8(QuantizedVector {
+                            codes: Vec::new(),
+                            scale,
+                            squared_norm,
+                        })
+                    } else {
+                        let codes: Vec<i8> = code_bytes
+                            .iter()
+                            .map(|value| i8::from_le_bytes([*value]))
+                            .collect();
+                        let squared_norm = quantized_squared_norm(&codes, scale);
+                        PreparedVector::ScalarInt8(QuantizedVector {
+                            codes,
+                            scale,
+                            squared_norm,
+                        })
+                    }
+                }
+            };
+            if !matches!(vectors, VectorArena::MappedScalarInt8 { .. }) {
+                vectors.push(vector);
             }
             let layer_count = decoder.usize()?;
             if layer_count == 0 || layer_count > MAX_LEVEL + 1 {
@@ -304,11 +794,18 @@ impl HnswIndex {
                 }
                 let mut layer = Vec::with_capacity(count);
                 for _ in 0..count {
-                    layer.push(decoder.usize()?);
+                    layer.push(u32::try_from(decoder.usize()?).map_err(|_| {
+                        Error::CorruptStorage("HNSW neighbor index exceeds u32".into())
+                    })?);
                 }
                 neighbors.push(layer);
             }
-            nodes.push(Node { id, neighbors });
+            nodes.push(Node {
+                level: (layer_count - 1) as u8,
+                range_start: 0,
+                neighbors,
+            });
+            ids.push(id.into_boxed_str());
         }
         decoder.finish()?;
 
@@ -322,16 +819,15 @@ impl HnswIndex {
             let entry = entry_point.ok_or_else(|| {
                 Error::CorruptStorage("non-empty HNSW graph has no entry point".into())
             })?;
-            if entry >= node_count || nodes[entry].neighbors.len() <= max_level {
+            if entry >= node_count || usize::from(nodes[entry].level) < max_level {
                 return Err(Error::CorruptStorage("invalid HNSW entry point".into()));
             }
         }
         for (node_index, node) in nodes.iter().enumerate() {
             for layer in &node.neighbors {
-                if layer
-                    .iter()
-                    .any(|neighbor| *neighbor >= node_count || *neighbor == node_index)
-                {
+                if layer.iter().any(|neighbor| {
+                    *neighbor as usize >= node_count || *neighbor as usize == node_index
+                }) {
                     return Err(Error::CorruptStorage(
                         "HNSW graph contains an invalid neighbor".into(),
                     ));
@@ -339,15 +835,22 @@ impl HnswIndex {
             }
         }
 
-        Ok(Self {
+        let mut index = Self {
             dimension,
             metric,
             config,
             nodes,
+            ids,
             vectors,
             entry_point,
             max_level,
-        })
+            search_workspaces: Arc::new(Mutex::new(Vec::new())),
+            compact_graph: None,
+        };
+        index.finalize_compact_graph().map_err(|error| {
+            Error::CorruptStorage(format!("could not compact decoded HNSW graph: {error}"))
+        })?;
+        Ok(index)
     }
 
     fn insert_prepared(&mut self, point: PreparedPoint, workspace: &mut BuildWorkspace) {
@@ -372,7 +875,7 @@ impl HnswIndex {
             .expect("non-empty graph has an entry point");
         if self.max_level > level {
             for layer in ((level + 1)..=self.max_level).rev() {
-                current = self.greedy_closest(&point.vector, current, layer);
+                current = self.greedy_closest(point.vector.as_ref(), current, layer);
             }
         }
 
@@ -380,7 +883,7 @@ impl HnswIndex {
         let mut neighbors = vec![Vec::new(); level + 1];
         for layer in (0..=connected_levels).rev() {
             let candidates = self.search_layer_for_build(
-                &point.vector,
+                point.vector.as_ref(),
                 current,
                 self.config.ef_construction,
                 layer,
@@ -398,11 +901,13 @@ impl HnswIndex {
     fn apply_insertion(&mut self, point: PreparedPoint, plan: InsertionPlan) {
         let PreparedPoint { id, vector, level } = point;
         let new_index = self.nodes.len();
-        self.vectors.extend_from_slice(&vector);
+        self.vectors.push(vector);
         self.nodes.push(Node {
-            id,
+            level: level as u8,
+            range_start: 0,
             neighbors: vec![Vec::new(); level + 1],
         });
+        self.ids.push(id.into_boxed_str());
 
         if self.entry_point.is_none() {
             self.entry_point = Some(new_index);
@@ -411,9 +916,10 @@ impl HnswIndex {
         }
 
         for (layer, selected) in plan.neighbors.into_iter().enumerate() {
-            self.nodes[new_index].neighbors[layer].extend(selected.iter().map(|item| item.index));
+            self.nodes[new_index].neighbors[layer]
+                .extend(selected.iter().map(|item| item.index as u32));
             for neighbor in selected {
-                self.nodes[neighbor.index].neighbors[layer].push(new_index);
+                self.nodes[neighbor.index].neighbors[layer].push(new_index as u32);
                 if self.nodes[neighbor.index].neighbors[layer].len()
                     >= max_connections(self.config, layer).saturating_mul(2)
                 {
@@ -436,6 +942,50 @@ impl HnswIndex {
         }
     }
 
+    fn finalize_compact_graph(&mut self) -> Result<()> {
+        if self.compact_graph.is_some() {
+            return Ok(());
+        }
+        let range_count = self
+            .nodes
+            .iter()
+            .try_fold(0_usize, |count, node| {
+                count.checked_add(node.neighbors.len())
+            })
+            .ok_or_else(|| Error::ResourceExhausted("HNSW layer count overflows memory".into()))?;
+        let link_count = self
+            .nodes
+            .iter()
+            .try_fold(0_usize, |count, node| {
+                node.neighbors
+                    .iter()
+                    .try_fold(count, |count, layer| count.checked_add(layer.len()))
+            })
+            .ok_or_else(|| Error::ResourceExhausted("HNSW link count overflows memory".into()))?;
+        if range_count > u32::MAX as usize || link_count > u32::MAX as usize {
+            return Err(Error::ResourceExhausted(
+                "HNSW compact graph exceeds u32 address space".into(),
+            ));
+        }
+
+        let mut ranges = Vec::with_capacity(range_count);
+        let mut links = Vec::with_capacity(link_count);
+        for node in &mut self.nodes {
+            node.range_start = ranges.len() as u32;
+            for layer in node.neighbors.drain(..) {
+                let start = links.len() as u32;
+                links.extend(layer);
+                ranges.push(LinkRange {
+                    start,
+                    end: links.len() as u32,
+                });
+            }
+            node.neighbors.shrink_to_fit();
+        }
+        self.compact_graph = Some(CompactGraph { ranges, links });
+        Ok(())
+    }
+
     fn prune(&mut self, node: usize, layer: usize) {
         let limit = max_connections(self.config, layer);
         if self.nodes[node].neighbors[layer].len() <= limit {
@@ -444,31 +994,28 @@ impl HnswIndex {
         let mut candidates: Vec<HeapItem> = self.nodes[node].neighbors[layer]
             .iter()
             .map(|&index| HeapItem {
-                index,
-                score: self.metric.score(self.vector(node), self.vector(index)),
+                index: index as usize,
+                score: score_vectors(self.metric, self.vector(node), self.vector(index as usize)),
             })
             .collect();
         self.sort_items(&mut candidates);
         self.nodes[node].neighbors[layer] = self
             .select_neighbors(candidates, limit)
             .into_iter()
-            .map(|item| item.index)
+            .map(|item| item.index as u32)
             .collect();
     }
 
-    fn greedy_closest(&self, query: &[f32], start: usize, layer: usize) -> usize {
+    fn greedy_closest(&self, query: VectorRef<'_>, start: usize, layer: usize) -> usize {
         let mut current = start;
         loop {
             let mut best = current;
             let mut best_score = self.score(query, current);
             for &neighbor in self.neighbors(current, layer) {
+                let neighbor = neighbor as usize;
                 let score = self.score(query, neighbor);
-                if compare_scored(
-                    score,
-                    &self.nodes[neighbor].id,
-                    best_score,
-                    &self.nodes[best].id,
-                ) == Ordering::Less
+                if compare_scored(score, &self.ids[neighbor], best_score, &self.ids[best])
+                    == Ordering::Less
                 {
                     best = neighbor;
                     best_score = score;
@@ -481,13 +1028,20 @@ impl HnswIndex {
         }
     }
 
-    fn search_layer(&self, query: &[f32], entry: usize, ef: usize, layer: usize) -> Vec<HeapItem> {
+    fn search_layer(
+        &self,
+        query: VectorRef<'_>,
+        entry: usize,
+        ef: usize,
+        layer: usize,
+        workspace: &mut BuildWorkspace,
+    ) -> Vec<HeapItem> {
+        workspace.begin(self.nodes.len());
         let entry = HeapItem {
             index: entry,
             score: self.score(query, entry),
         };
-        let mut visited = HashSet::with_capacity(ef.saturating_mul(self.config.m).min(65_536));
-        visited.insert(entry.index);
+        workspace.visit(entry.index);
         let mut frontier = BinaryHeap::from([entry]);
         let mut results = BinaryHeap::from([Reverse(entry)]);
 
@@ -498,7 +1052,8 @@ impl HnswIndex {
             }
 
             for &neighbor in self.neighbors(candidate.index, layer) {
-                if !visited.insert(neighbor) {
+                let neighbor = neighbor as usize;
+                if !workspace.visit(neighbor) {
                     continue;
                 }
                 let item = HeapItem {
@@ -521,9 +1076,25 @@ impl HnswIndex {
         result
     }
 
+    fn take_search_workspace(&self) -> BuildWorkspace {
+        self.search_workspaces
+            .lock()
+            .ok()
+            .and_then(|mut workspaces| workspaces.pop())
+            .unwrap_or_else(|| BuildWorkspace::with_capacity(self.nodes.len()))
+    }
+
+    fn return_search_workspace(&self, workspace: BuildWorkspace) {
+        if let Ok(mut workspaces) = self.search_workspaces.lock()
+            && workspaces.len() < MAX_POOLED_SEARCH_WORKSPACES
+        {
+            workspaces.push(workspace);
+        }
+    }
+
     fn search_layer_for_build(
         &self,
-        query: &[f32],
+        query: VectorRef<'_>,
         entry: usize,
         ef: usize,
         layer: usize,
@@ -544,6 +1115,7 @@ impl HnswIndex {
                 break;
             }
             for &neighbor in self.neighbors(candidate.index, layer) {
+                let neighbor = neighbor as usize;
                 if !workspace.visit(neighbor) {
                     continue;
                 }
@@ -576,9 +1148,11 @@ impl HnswIndex {
                 break;
             }
             let diverse = selected.iter().all(|other: &HeapItem| {
-                self.metric
-                    .score(self.vector(candidate.index), self.vector(other.index))
-                    < candidate.score
+                score_vectors(
+                    self.metric,
+                    self.vector(candidate.index),
+                    self.vector(other.index),
+                ) < candidate.score
             });
             if diverse {
                 selected.push(candidate);
@@ -594,31 +1168,148 @@ impl HnswIndex {
         items.sort_unstable_by(|left, right| {
             compare_scored(
                 left.score,
-                &self.nodes[left.index].id,
+                &self.ids[left.index],
                 right.score,
-                &self.nodes[right.index].id,
+                &self.ids[right.index],
             )
         });
     }
 
-    fn neighbors(&self, node: usize, layer: usize) -> &[usize] {
-        self.nodes[node]
-            .neighbors
-            .get(layer)
-            .map(Vec::as_slice)
-            .unwrap_or_default()
+    fn neighbors(&self, node: usize, layer: usize) -> &[u32] {
+        let node = &self.nodes[node];
+        if layer > usize::from(node.level) {
+            return &[];
+        }
+        if let Some(graph) = &self.compact_graph {
+            let range = graph.ranges[node.range_start as usize + layer];
+            &graph.links[range.start as usize..range.end as usize]
+        } else {
+            node.neighbors
+                .get(layer)
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+        }
     }
 
-    fn score(&self, query: &[f32], node: usize) -> f32 {
-        self.metric.score(query, self.vector(node))
+    fn score(&self, query: VectorRef<'_>, node: usize) -> f32 {
+        score_vectors(self.metric, query, self.vector(node))
     }
 
-    fn vector(&self, node: usize) -> &[f32] {
-        let start = node * self.dimension;
-        &self.vectors[start..start + self.dimension]
+    fn vector(&self, node: usize) -> VectorRef<'_> {
+        self.vectors.get(node, self.dimension)
     }
 }
 
+fn score_vectors(metric: Metric, left: VectorRef<'_>, right: VectorRef<'_>) -> f32 {
+    match (left, right) {
+        (VectorRef::F32(left), VectorRef::F32(right)) => metric.score(left, right),
+        (
+            VectorRef::ScalarInt8 {
+                codes: left,
+                scale: left_scale,
+                squared_norm: left_norm,
+            },
+            VectorRef::ScalarInt8 {
+                codes: right,
+                scale: right_scale,
+                squared_norm: right_norm,
+            },
+        ) => {
+            let dot = quantized_dot(left, left_scale, right, right_scale);
+            match metric {
+                Metric::Cosine => {
+                    let denominator = (left_norm * right_norm).sqrt();
+                    if denominator > 0.0 {
+                        dot / denominator
+                    } else {
+                        0.0
+                    }
+                }
+                Metric::DotProduct => dot,
+                Metric::Euclidean => -(left_norm + right_norm - 2.0 * dot).max(0.0),
+            }
+        }
+        _ => unreachable!("HNSW queries and stored vectors use the same representation"),
+    }
+}
+
+fn quantized_dot(left: &[i8], left_scale: f32, right: &[i8], right_scale: f32) -> f32 {
+    quantized_integer_dot(left, right) as f32 * left_scale * right_scale
+}
+
+fn quantized_integer_dot(left: &[i8], right: &[i8]) -> i64 {
+    debug_assert_eq!(left.len(), right.len());
+    #[cfg(target_arch = "x86_64")]
+    if left.len() <= 65_536 && std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 availability is checked at runtime and both slices have
+        // the same length. The implementation uses unaligned, in-bounds loads.
+        return unsafe { quantized_integer_dot_avx2(left, right) };
+    }
+    quantized_integer_dot_portable(left, right)
+}
+
+fn quantized_integer_dot_portable(left: &[i8], right: &[i8]) -> i64 {
+    let mut sums = [0_i64; 4];
+    let mut left_chunks = left.chunks_exact(4);
+    let mut right_chunks = right.chunks_exact(4);
+    for (left, right) in left_chunks.by_ref().zip(right_chunks.by_ref()) {
+        sums[0] += i64::from(left[0]) * i64::from(right[0]);
+        sums[1] += i64::from(left[1]) * i64::from(right[1]);
+        sums[2] += i64::from(left[2]) * i64::from(right[2]);
+        sums[3] += i64::from(left[3]) * i64::from(right[3]);
+    }
+    let tail = left_chunks
+        .remainder()
+        .iter()
+        .zip(right_chunks.remainder())
+        .map(|(left, right)| i64::from(*left) * i64::from(*right))
+        .sum::<i64>();
+    sums.into_iter().sum::<i64>() + tail
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn quantized_integer_dot_avx2(left: &[i8], right: &[i8]) -> i64 {
+    use std::arch::x86_64::{
+        __m128i, __m256i, _mm_loadu_si128, _mm256_add_epi32, _mm256_cvtepi8_epi16,
+        _mm256_madd_epi16, _mm256_setzero_si256, _mm256_storeu_si256,
+    };
+
+    let vectorized = left.len() / 16 * 16;
+    let mut sums = _mm256_setzero_si256();
+    let mut offset = 0;
+    while offset < vectorized {
+        // SAFETY: offset advances in 16-byte chunks and remains below the
+        // rounded-down vectorized length. Unaligned loads are intentional.
+        let left_bytes = unsafe { _mm_loadu_si128(left.as_ptr().add(offset).cast::<__m128i>()) };
+        // SAFETY: same bounds argument as the left-hand load.
+        let right_bytes = unsafe { _mm_loadu_si128(right.as_ptr().add(offset).cast::<__m128i>()) };
+        let left_words = _mm256_cvtepi8_epi16(left_bytes);
+        let right_words = _mm256_cvtepi8_epi16(right_bytes);
+        sums = _mm256_add_epi32(sums, _mm256_madd_epi16(left_words, right_words));
+        offset += 16;
+    }
+
+    let mut lanes = [0_i32; 8];
+    // SAFETY: lanes has exactly the 32 bytes required by the unaligned store.
+    unsafe { _mm256_storeu_si256(lanes.as_mut_ptr().cast::<__m256i>(), sums) };
+    lanes.into_iter().map(i64::from).sum::<i64>()
+        + quantized_integer_dot_portable(&left[vectorized..], &right[vectorized..])
+}
+
+fn quantized_squared_norm(codes: &[i8], scale: f32) -> f32 {
+    quantized_dot(codes, scale, codes, scale)
+}
+
+fn quantized_squared_norm_bytes(codes: &[u8], scale: f32) -> f32 {
+    let sum = codes.iter().fold(0_i64, |sum, &code| {
+        let code = i64::from(i8::from_le_bytes([code]));
+        sum + code * code
+    });
+    sum as f32 * scale * scale
+}
+
+#[derive(Debug)]
 struct BuildWorkspace {
     visited: Vec<u32>,
     generation: u32,
@@ -743,16 +1434,33 @@ fn parse_metric(tag: u8) -> Result<Metric> {
     }
 }
 
-fn put_u32(output: &mut Vec<u8>, value: usize) -> Result<()> {
+fn storage_tag(storage: HnswVectorStorage) -> u8 {
+    match storage {
+        HnswVectorStorage::F32 => 1,
+        HnswVectorStorage::ScalarInt8 => 2,
+    }
+}
+
+fn parse_storage(tag: u8) -> Result<HnswVectorStorage> {
+    match tag {
+        1 => Ok(HnswVectorStorage::F32),
+        2 => Ok(HnswVectorStorage::ScalarInt8),
+        _ => Err(Error::CorruptStorage(format!(
+            "unknown HNSW vector storage tag {tag}"
+        ))),
+    }
+}
+
+fn put_u32_writer(output: &mut impl Write, value: usize) -> Result<()> {
     let value = u32::try_from(value)
         .map_err(|_| Error::InvalidQuery("HNSW graph value exceeds format limit"))?;
-    output.extend_from_slice(&value.to_le_bytes());
+    output.write_all(&value.to_le_bytes())?;
     Ok(())
 }
 
-fn put_bytes(output: &mut Vec<u8>, value: &[u8]) -> Result<()> {
-    put_u32(output, value.len())?;
-    output.extend_from_slice(value);
+fn put_bytes_writer(output: &mut impl Write, value: &[u8]) -> Result<()> {
+    put_u32_writer(output, value.len())?;
+    output.write_all(value)?;
     Ok(())
 }
 
@@ -777,6 +1485,10 @@ impl<'a> GraphDecoder<'a> {
             .ok_or_else(|| Error::CorruptStorage("truncated HNSW graph".into()))?;
         self.position = end;
         Ok(value)
+    }
+
+    fn position(&self) -> usize {
+        self.position
     }
 
     fn byte(&mut self) -> Result<u8> {
@@ -816,6 +1528,8 @@ impl<'a> GraphDecoder<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+
     use super::*;
 
     fn points(count: usize) -> Vec<(String, Vec<f32>)> {
@@ -850,6 +1564,32 @@ mod tests {
             let hits = index.search(vec![0.9, 0.1], 2, 8).unwrap();
             assert_eq!(hits[0].id, "a");
         }
+    }
+
+    #[test]
+    fn pooled_search_workspaces_are_safe_under_contention() {
+        let index = Arc::new(
+            HnswIndex::build_quantized(3, Metric::Cosine, HnswConfig::default(), points(1_000))
+                .unwrap(),
+        );
+        let workers: Vec<_> = (0..16)
+            .map(|worker| {
+                let index = Arc::clone(&index);
+                thread::spawn(move || {
+                    for query in 0..100 {
+                        let angle = (worker * 100 + query) as f32 * 0.137;
+                        let hits = index
+                            .search(vec![angle.cos(), angle.sin(), (angle * 0.31).cos()], 10, 64)
+                            .unwrap();
+                        assert_eq!(hits.len(), 10);
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert!(index.search_workspaces.lock().unwrap().len() <= MAX_POOLED_SEARCH_WORKSPACES);
     }
 
     #[test]
@@ -962,12 +1702,311 @@ mod tests {
             points(100),
         )
         .unwrap();
-        let restored = HnswIndex::decode(&original.encode().unwrap()).unwrap();
+        let encoded = original.encode().unwrap();
+        assert_eq!(encoded.len(), original.encoded_len().unwrap());
+        let restored = HnswIndex::decode(&encoded).unwrap();
         assert_eq!(restored.len(), original.len());
         assert_eq!(restored.config(), original.config());
         assert_eq!(
             restored.search(vec![0.2, 0.8, 0.4], 10, 32).unwrap(),
             original.search(vec![0.2, 0.8, 0.4], 10, 32).unwrap()
         );
+    }
+
+    #[test]
+    fn quantized_search_supports_every_metric_and_zero_vectors() {
+        for metric in [Metric::Cosine, Metric::DotProduct, Metric::Euclidean] {
+            let mut input = vec![
+                ("a".into(), vec![10.0, 0.2, -0.1, 0.0]),
+                ("b".into(), vec![0.1, 9.0, 0.2, 0.0]),
+                ("c".into(), vec![-8.0, 0.1, 0.0, 0.0]),
+            ];
+            if metric != Metric::Cosine {
+                input.push(("zero".into(), vec![0.0; 4]));
+            }
+            let index = HnswIndex::build_quantized(
+                4,
+                metric,
+                HnswConfig {
+                    m: 8,
+                    ef_construction: 32,
+                },
+                input,
+            )
+            .unwrap();
+            let hits = index.search(vec![9.0, 0.1, 0.0, 0.0], 2, 8).unwrap();
+            assert_eq!(hits[0].id, "a", "metric {metric:?}");
+            assert!(hits.iter().all(|hit| hit.score.is_finite()));
+        }
+    }
+
+    #[test]
+    fn quantized_vectors_use_about_one_quarter_of_f32_storage() {
+        let input: Vec<_> = (0..100)
+            .map(|index| {
+                (
+                    format!("p-{index}"),
+                    (0..768)
+                        .map(|dimension| ((index * 769 + dimension) as f32 * 0.017).sin())
+                        .collect(),
+                )
+            })
+            .collect();
+        let config = HnswConfig {
+            m: 8,
+            ef_construction: 32,
+        };
+        let full = HnswIndex::build(768, Metric::Cosine, config, input.clone()).unwrap();
+        let quantized = HnswIndex::build_quantized(768, Metric::Cosine, config, input).unwrap();
+        assert_eq!(full.vector_storage_bytes(), 100 * 768 * 4);
+        assert_eq!(quantized.vector_storage_bytes(), 100 * (768 + 8));
+        assert!(quantized.vector_storage_bytes() * 3 < full.vector_storage_bytes());
+        assert!(quantized.encode().unwrap().len() * 2 < full.encode().unwrap().len());
+    }
+
+    #[test]
+    fn quantized_graph_round_trips_for_every_metric() {
+        for metric in [Metric::Cosine, Metric::DotProduct, Metric::Euclidean] {
+            let original = HnswIndex::build_quantized(
+                3,
+                metric,
+                HnswConfig {
+                    m: 8,
+                    ef_construction: 40,
+                },
+                points(100),
+            )
+            .unwrap();
+            let encoded = original.encode().unwrap();
+            let restored = HnswIndex::decode(&encoded).unwrap();
+            assert_eq!(restored.vector_storage(), HnswVectorStorage::ScalarInt8);
+            assert_eq!(
+                restored.vector_storage_bytes(),
+                original.vector_storage_bytes()
+            );
+            assert_eq!(
+                restored.search(vec![0.2, 0.8, 0.4], 10, 32).unwrap(),
+                original.search(vec![0.2, 0.8, 0.4], 10, 32).unwrap(),
+                "metric {metric:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decoder_accepts_version_one_f32_graphs() {
+        let index = HnswIndex::build(
+            3,
+            Metric::Cosine,
+            HnswConfig {
+                m: 8,
+                ef_construction: 32,
+            },
+            points(20),
+        )
+        .unwrap();
+        let mut legacy = index.encode().unwrap();
+        assert_eq!(legacy[4], GRAPH_VERSION);
+        assert_eq!(legacy[14], storage_tag(HnswVectorStorage::F32));
+        legacy[4] = LEGACY_GRAPH_VERSION;
+        legacy.remove(14);
+        let restored = HnswIndex::decode(&legacy).unwrap();
+        assert_eq!(restored.vector_storage(), HnswVectorStorage::F32);
+        assert_eq!(
+            restored.search(vec![0.2, 0.8, 0.4], 5, 16).unwrap(),
+            index.search(vec![0.2, 0.8, 0.4], 5, 16).unwrap()
+        );
+    }
+
+    #[test]
+    fn decoder_rejects_corrupt_quantization_parameters() {
+        let index = HnswIndex::build_quantized(
+            2,
+            Metric::DotProduct,
+            HnswConfig::default(),
+            [("a".into(), vec![1.0, 2.0])],
+        )
+        .unwrap();
+        let mut encoded = index.encode().unwrap();
+        // Fixed header (39 bytes), then the four-byte ID length and one-byte ID.
+        encoded[44..48].copy_from_slice(&f32::NAN.to_le_bytes());
+        assert!(matches!(
+            HnswIndex::decode(&encoded),
+            Err(Error::CorruptStorage(_))
+        ));
+    }
+
+    #[test]
+    fn quantized_parallel_builds_are_deterministic() {
+        let input = points(PARALLEL_BUILD_SEED + 128);
+        let build = || {
+            HnswIndex::build_quantized(
+                3,
+                Metric::Cosine,
+                HnswConfig {
+                    m: 8,
+                    ef_construction: 32,
+                },
+                input.clone(),
+            )
+            .unwrap()
+        };
+        assert_eq!(build().encode().unwrap(), build().encode().unwrap());
+    }
+
+    #[test]
+    fn graph_is_identical_across_rayon_pool_sizes() {
+        let input = points(PARALLEL_BUILD_SEED + 128);
+        for storage in [HnswVectorStorage::F32, HnswVectorStorage::ScalarInt8] {
+            let build = |threads| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap()
+                    .install(|| {
+                        HnswIndex::build_with_storage(
+                            3,
+                            Metric::Cosine,
+                            HnswConfig {
+                                m: 8,
+                                ef_construction: 32,
+                            },
+                            storage,
+                            input.clone(),
+                        )
+                        .unwrap()
+                        .encode()
+                        .unwrap()
+                    })
+            };
+            assert_eq!(build(1), build(4), "storage {storage:?}");
+        }
+    }
+
+    #[test]
+    fn quantized_candidate_recall_is_high() {
+        let input: Vec<_> = (0..1_000)
+            .map(|index| {
+                let vector = (0..64)
+                    .map(|dimension| {
+                        ((index * 67 + dimension * 13) as f32 * 0.019).sin()
+                            + ((index + dimension * 7) as f32 * 0.007).cos()
+                    })
+                    .collect();
+                (format!("point-{index:04}"), vector)
+            })
+            .collect();
+        let index = HnswIndex::build_quantized(
+            64,
+            Metric::Cosine,
+            HnswConfig {
+                m: 16,
+                ef_construction: 120,
+            },
+            input.clone(),
+        )
+        .unwrap();
+        let mut matches = 0;
+        let mut total = 0;
+        for query_index in (0..1_000).step_by(29) {
+            let query = input[query_index].1.clone();
+            let candidates: HashSet<_> = index
+                .search(query.clone(), 40, 128)
+                .unwrap()
+                .into_iter()
+                .map(|hit| hit.id)
+                .collect();
+            let prepared = Metric::Cosine.prepare(query).unwrap();
+            let mut exact = input.clone();
+            exact.sort_unstable_by(|left, right| {
+                compare_scored(
+                    Metric::Cosine
+                        .score(&prepared, &Metric::Cosine.prepare(left.1.clone()).unwrap()),
+                    &left.0,
+                    Metric::Cosine
+                        .score(&prepared, &Metric::Cosine.prepare(right.1.clone()).unwrap()),
+                    &right.0,
+                )
+            });
+            for (id, _) in exact.iter().take(10) {
+                total += 1;
+                matches += usize::from(candidates.contains(id));
+            }
+        }
+        let recall = matches as f64 / total as f64;
+        assert!(
+            recall >= 0.98,
+            "quantized candidate recall@10 was {recall:.3}"
+        );
+    }
+
+    #[test]
+    fn scalar_int8_scores_track_f32_across_metrics() {
+        for metric in [Metric::Cosine, Metric::DotProduct, Metric::Euclidean] {
+            for sample in 0..500 {
+                let left: Vec<_> = (0..64)
+                    .map(|dimension| ((sample * 67 + dimension * 19) as f32 * 0.013).sin() * 3.7)
+                    .collect();
+                let right: Vec<_> = (0..64)
+                    .map(|dimension| ((sample * 29 + dimension * 43) as f32 * 0.011).cos() * 2.3)
+                    .collect();
+                let left = metric.prepare(left).unwrap();
+                let right = metric.prepare(right).unwrap();
+                let exact = metric.score(&left, &right);
+                let quantized = score_vectors(
+                    metric,
+                    QuantizedVector::new(&left).as_ref(),
+                    QuantizedVector::new(&right).as_ref(),
+                );
+                let scale = match metric {
+                    Metric::Cosine => 1.0,
+                    Metric::DotProduct => {
+                        let left_norm = left.iter().map(|value| value * value).sum::<f32>().sqrt();
+                        let right_norm =
+                            right.iter().map(|value| value * value).sum::<f32>().sqrt();
+                        1.0 + left_norm * right_norm
+                    }
+                    Metric::Euclidean => 1.0 + exact.abs(),
+                };
+                let relative_error = (exact - quantized).abs() / scale;
+                assert!(
+                    relative_error < 0.025,
+                    "metric {metric:?} sample {sample}: exact={exact} quantized={quantized} error={relative_error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn simd_integer_dot_matches_portable_at_boundaries_and_extremes() {
+        for length in [0, 1, 3, 15, 16, 17, 31, 32, 33, 127, 128, 129, 4_096] {
+            let left: Vec<_> = (0..length)
+                .map(|index| match index % 5 {
+                    0 => -127,
+                    1 => 127,
+                    2 => -1,
+                    3 => 1,
+                    _ => ((index * 37) % 255) as i16 as i8,
+                })
+                .collect();
+            let right: Vec<_> = (0..length)
+                .map(|index| match index % 7 {
+                    0 => 127,
+                    1 => -127,
+                    2 => 1,
+                    3 => -1,
+                    _ => ((index * 53) % 255) as i16 as i8,
+                })
+                .collect();
+            let expected = quantized_integer_dot_portable(&left, &right);
+            assert_eq!(quantized_integer_dot(&left, &right), expected);
+            #[cfg(target_arch = "x86_64")]
+            if std::arch::is_x86_feature_detected!("avx2") {
+                // SAFETY: guarded by runtime AVX2 detection.
+                assert_eq!(
+                    unsafe { quantized_integer_dot_avx2(&left, &right) },
+                    expected
+                );
+            }
+        }
     }
 }

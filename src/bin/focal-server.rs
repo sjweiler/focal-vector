@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use focal_vector::{Database, DatabaseConfig, ServerConfig, load_server_tls, router};
+use focal_vector::{Database, DatabaseConfig, ServerConfig, load_server_tls, router, serve_local};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -23,6 +23,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_concurrent_operations: environment_usize("FOCAL_MAX_CONCURRENT_OPERATIONS", 64)?,
     };
     let database = Arc::new(Database::open(data_directory, DatabaseConfig::default())?);
+    if let Some(socket) =
+        env::var_os(focal_vector_protocol::SOCKET_ENV).filter(|path| !path.is_empty())
+    {
+        let socket = std::path::PathBuf::from(socket);
+        println!("focal-vector listening on unix://{}", socket.display());
+        tokio::select! {
+            result = serve_local(&socket, database, server_config) => result?,
+            _ = shutdown_signal() => {}
+        }
+        return Ok(());
+    }
     let application = router(database, server_config)?;
     let certificate = env::var("FOCAL_TLS_CERT").ok();
     let private_key = env::var("FOCAL_TLS_KEY").ok();

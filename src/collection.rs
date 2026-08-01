@@ -1,7 +1,11 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
+use std::fmt;
+use std::ops::Deref;
+use std::sync::{Arc, OnceLock};
 
-use serde::{Deserialize, Serialize};
+use memmap2::Mmap;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{Error, Filter, Metric, Result, Value};
 
@@ -18,12 +22,182 @@ pub struct UpsertPoint {
     pub metadata: BTreeMap<String, Value>,
 }
 
+#[derive(Clone)]
+pub(crate) struct PointVector(PointVectorStorage);
+
+#[derive(Clone)]
+enum PointVectorStorage {
+    Owned(Vec<f32>),
+    Mapped {
+        mapping: Arc<Mmap>,
+        offset: usize,
+        len: usize,
+    },
+}
+
+impl PointVector {
+    pub(crate) fn as_slice(&self) -> &[f32] {
+        match &self.0 {
+            PointVectorStorage::Owned(vector) => vector,
+            PointVectorStorage::Mapped {
+                mapping,
+                offset,
+                len,
+            } => {
+                let bytes = &mapping[*offset..*offset + *len * size_of::<f32>()];
+                // SAFETY: segment writers align every mapped vector to four
+                // bytes, f32 accepts every bit pattern, and the checksum and
+                // finite-value validation happen before construction.
+                unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<f32>(), *len) }
+            }
+        }
+    }
+
+    pub(crate) fn is_memory_mapped(&self) -> bool {
+        matches!(self.0, PointVectorStorage::Mapped { .. })
+    }
+
+    pub(crate) fn mapped(mapping: Arc<Mmap>, offset: usize, len: usize) -> Result<Self> {
+        let byte_len = len
+            .checked_mul(size_of::<f32>())
+            .ok_or_else(|| Error::CorruptStorage("mapped vector length overflows".into()))?;
+        let end = offset
+            .checked_add(byte_len)
+            .ok_or_else(|| Error::CorruptStorage("mapped vector offset overflows".into()))?;
+        if !offset.is_multiple_of(align_of::<f32>()) || end > mapping.len() {
+            return Err(Error::CorruptStorage(
+                "mapped vector is unaligned or outside its segment".into(),
+            ));
+        }
+        Ok(Self(PointVectorStorage::Mapped {
+            mapping,
+            offset,
+            len,
+        }))
+    }
+}
+
+impl From<Vec<f32>> for PointVector {
+    fn from(vector: Vec<f32>) -> Self {
+        Self(PointVectorStorage::Owned(vector))
+    }
+}
+
+impl Deref for PointVector {
+    type Target = [f32];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl AsRef<[f32]> for PointVector {
+    fn as_ref(&self) -> &[f32] {
+        self.as_slice()
+    }
+}
+
+impl<'a> IntoIterator for &'a PointVector {
+    type Item = &'a f32;
+    type IntoIter = std::slice::Iter<'a, f32>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
+}
+
+impl fmt::Debug for PointVector {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.as_slice().fmt(formatter)
+    }
+}
+
+impl PartialEq for PointVector {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Serialize for PointVector {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        self.as_slice().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for PointVector {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        Vec::<f32>::deserialize(deserializer).map(Self::from)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Point {
     pub id: String,
     pub vector: Vec<f32>,
     pub metadata: BTreeMap<String, Value>,
     pub sequence: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredPoint {
+    pub id: String,
+    pub vector: PointVector,
+    pub metadata: BTreeMap<String, Value>,
+    pub sequence: u64,
+    pub public_view: OnceLock<Point>,
+}
+
+impl StoredPoint {
+    fn to_owned_point(&self) -> Point {
+        Point {
+            id: self.id.clone(),
+            vector: self.vector.as_slice().to_vec(),
+            metadata: self.metadata.clone(),
+            sequence: self.sequence,
+        }
+    }
+
+    fn into_owned(self) -> Point {
+        self.public_view.into_inner().unwrap_or_else(|| Point {
+            id: self.id,
+            vector: self.vector.as_slice().to_vec(),
+            metadata: self.metadata,
+            sequence: self.sequence,
+        })
+    }
+}
+
+impl Clone for StoredPoint {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            vector: self.vector.clone(),
+            metadata: self.metadata.clone(),
+            sequence: self.sequence,
+            public_view: OnceLock::new(),
+        }
+    }
+}
+
+impl PartialEq for StoredPoint {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.vector == other.vector
+            && self.metadata == other.metadata
+            && self.sequence == other.sequence
+    }
+}
+
+impl From<Point> for StoredPoint {
+    fn from(point: Point) -> Self {
+        Self {
+            id: point.id,
+            vector: point.vector.into(),
+            metadata: point.metadata,
+            sequence: point.sequence,
+            public_view: OnceLock::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -38,7 +212,7 @@ pub struct SearchHit {
 #[derive(Debug)]
 pub struct Collection {
     config: CollectionConfig,
-    points: HashMap<String, Point>,
+    points: HashMap<String, StoredPoint>,
     sequence: u64,
 }
 
@@ -90,6 +264,12 @@ impl Collection {
     }
 
     pub fn get(&self, id: &str) -> Option<&Point> {
+        self.points
+            .get(id)
+            .map(|point| point.public_view.get_or_init(|| point.to_owned_point()))
+    }
+
+    pub(crate) fn get_stored(&self, id: &str) -> Option<&StoredPoint> {
         self.points.get(id)
     }
 
@@ -126,7 +306,7 @@ impl Collection {
         &self,
         points: Vec<UpsertPoint>,
         sequence: u64,
-    ) -> Result<Vec<Point>> {
+    ) -> Result<Vec<StoredPoint>> {
         if points.is_empty() {
             return Err(Error::InvalidQuery("upsert batch must not be empty"));
         }
@@ -141,17 +321,18 @@ impl Collection {
             if point.id.is_empty() {
                 return Err(Error::InvalidQuery("point ID must not be empty"));
             }
-            prepared.push(Point {
+            prepared.push(StoredPoint {
                 id: point.id,
-                vector: self.config.metric.prepare(point.vector)?,
+                vector: self.config.metric.prepare(point.vector)?.into(),
                 metadata: point.metadata,
                 sequence,
+                public_view: OnceLock::new(),
             });
         }
         Ok(prepared)
     }
 
-    pub(crate) fn apply_prepared_upsert(&mut self, points: Vec<Point>, sequence: u64) {
+    pub(crate) fn apply_prepared_upsert(&mut self, points: Vec<StoredPoint>, sequence: u64) {
         for point in points {
             self.points.insert(point.id.clone(), point);
         }
@@ -166,9 +347,48 @@ impl Collection {
     }
 
     pub(crate) fn snapshot_points(&self) -> Vec<Point> {
-        let mut points: Vec<Point> = self.points.values().cloned().collect();
+        let mut points: Vec<Point> = self
+            .points
+            .values()
+            .cloned()
+            .map(StoredPoint::into_owned)
+            .collect();
         points.sort_unstable_by(|left, right| left.id.cmp(&right.id));
         points
+    }
+
+    pub(crate) fn snapshot_stored_points(&self) -> Vec<StoredPoint> {
+        let mut points: Vec<StoredPoint> = self.points.values().cloned().collect();
+        points.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+        points
+    }
+
+    pub(crate) fn vector_storage_stats(&self) -> (usize, usize, usize) {
+        self.points
+            .values()
+            .fold((0, 0, 0), |(mapped, owned, owned_bytes), point| {
+                if point.vector.is_memory_mapped() {
+                    (mapped + 1, owned, owned_bytes)
+                } else {
+                    (
+                        mapped,
+                        owned + 1,
+                        owned_bytes + point.vector.len() * size_of::<f32>(),
+                    )
+                }
+            })
+    }
+
+    pub(crate) fn replace_persisted_points(&mut self, points: Vec<StoredPoint>) {
+        for point in points {
+            if self
+                .points
+                .get(&point.id)
+                .is_some_and(|current| current.sequence == point.sequence)
+            {
+                self.points.insert(point.id.clone(), point);
+            }
+        }
     }
 
     pub(crate) fn search_ids(
@@ -201,7 +421,7 @@ impl Collection {
         &'a self,
         query: &[f32],
         k: usize,
-        points: impl Iterator<Item = &'a Point>,
+        points: impl Iterator<Item = &'a StoredPoint>,
     ) -> Vec<SearchHit> {
         let mut heap = BinaryHeap::with_capacity(k.saturating_add(1));
         for point in points {
@@ -230,6 +450,17 @@ impl Collection {
     }
 
     pub(crate) fn restore_snapshot(&mut self, points: Vec<Point>, sequence: u64) -> Result<()> {
+        self.restore_stored_snapshot(
+            points.into_iter().map(StoredPoint::from).collect(),
+            sequence,
+        )
+    }
+
+    pub(crate) fn restore_stored_snapshot(
+        &mut self,
+        points: Vec<StoredPoint>,
+        sequence: u64,
+    ) -> Result<()> {
         if points.iter().any(|point| point.sequence > sequence) {
             return Err(Error::CorruptStorage(
                 "point sequence is newer than its segment".into(),
@@ -250,7 +481,7 @@ impl Collection {
 
 #[derive(Clone, Copy)]
 struct RankedPoint<'a> {
-    point: &'a Point,
+    point: &'a StoredPoint,
     score: f32,
 }
 

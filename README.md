@@ -2,11 +2,15 @@
 
 [![Rust](https://img.shields.io/badge/Rust-2024%20edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![Dependencies](https://img.shields.io/badge/Runtime%20dependencies-10-brightgreen.svg)](Cargo.toml)
-[![Tests](https://img.shields.io/badge/Tests-53%20passing-brightgreen.svg)](#try-it)
+[![Dependencies](https://img.shields.io/badge/Runtime%20dependencies-12-brightgreen.svg)](Cargo.toml)
+[![Tests](https://img.shields.io/badge/Tests-77%20passing-brightgreen.svg)](#try-it)
 
 Focal Vector is a low-latency, durable vector database with both single-node
 and replicated, hash-sharded execution paths.
+
+For FocalDesk, the intended deployment is a separate single-node user service.
+The compositor does not link or execute vector storage code; `focaldesk-ai`
+reaches the daemon through its private local IPC socket.
 
 The proposed architecture, data model, APIs, indexing strategy, and delivery
 plan are documented in [DESIGN.md](DESIGN.md).
@@ -34,10 +38,10 @@ Synchronous commits are acknowledged only after `sync_data`, collection
 configuration is persisted and verified on reopen, complete mutations recover
 after restart, and a torn final frame is safely discarded.
 
-Calling `PersistentCollection::flush` writes a checksummed immutable snapshot,
-atomically publishes its manifest, and checkpoints the WAL. The publication
-order is crash-safe, and obsolete snapshots are retired after the new manifest
-is durable.
+Calling `PersistentCollection::flush` streams a checksummed immutable snapshot
+to a temporary file, atomically publishes its manifest, and checkpoints the
+WAL. CRC32C is computed while writing, so flush does not assemble a second
+segment-sized byte buffer. The publication order is crash-safe.
 
 The Rust core also includes a deterministic HNSW implementation. It supports all
 three metrics, configurable graph density and construction breadth, and a
@@ -47,15 +51,23 @@ Exact search remains the reference engine and the path for metadata-filtered
 queries.
 
 Committed mutations are kept as a small exact-search delta and merged with HNSW
-results, so writes do not disable the immutable graph. The next flush folds that
-delta into a newly built graph.
+results, so writes do not disable immutable graphs. Routine flushes build a new
+HNSW segment only for changed live IDs. Search fans out across at most eight
+immutable graph segments and suppresses stale versions and tombstones against
+the authoritative snapshot. The ninth flush compacts them into one full graph;
+obsolete files are retired only after the replacement manifest is durable.
 
 Immutable snapshots also carry in-memory equality and numeric-range indexes for
 metadata query planning. Compound filters search only matching snapshot IDs and
 merge them with filtered dirty points.
 
-Segment recovery uses a read-only memory map, avoiding a second whole-file input
-buffer while checksums and graph structures are decoded.
+Segment recovery uses read-only memory maps. Persistent scalar-int8 HNSW code
+slices and aligned full-precision point vectors are scored directly from those
+maps instead of being copied into heap arenas. The internal mapped-vector type
+is separate from the public `Point`, whose `vector` field remains `Vec<f32>` for
+source and wire compatibility. `Collection::get` lazily caches an owned public
+view only for explicitly fetched IDs; search and reranking stay zero-copy.
+Unflushed writes alone use owned authoritative vectors.
 
 Collection directories use operating-system exclusive file locks, preventing a
 second process or handle from opening the same collection for writing.
@@ -66,6 +78,7 @@ second process or handle from opening the same collection for writing.
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo run --release --bin focal-bench -- 10000 128 100 96
+cargo run --release --bin focal-persistence-bench -- 100000 128 1000
 ```
 
 The benchmark arguments are `points dimensions queries ef_search m
@@ -78,16 +91,35 @@ FOCAL_BENCH_EF_SWEEP=96,192,384,768 \
 cargo run --release --bin focal-bench -- 1000000 128 100 96 32 400
 ```
 
+Set `FOCAL_BENCH_STORAGE=int8` to benchmark scalar-int8 graph storage, or
+`FOCAL_BENCH_STORAGE=both` for an identical-corpus A/B run. The benchmark
+defaults to `f32` so historical measurements remain comparable. It also reports
+layer, link, ID, and vector-arena sizes for regression profiling.
+
+`focal-persistence-bench` measures a full durable flush followed by a changed-ID
+delta flush. Its arguments are `points dimensions delta_points`. On the same
+100k × 128 corpus, changing 1,000 points reduced the segment from 83.6 MB to
+0.83 MB and flush time from 8.73 s to 121.6 ms. The exact numbers depend on
+storage and CPU, but the benchmark also asserts that publication leaves zero
+owned authoritative vector bytes.
+
 ### HNSW construction and tuning
 
-The builder stores all vectors in one contiguous `f32` arena and constructs the
-graph in deterministic batches. It builds a 4,096-point seed graph serially,
+The builder stores vectors in a contiguous `f32` or scalar-int8 arena and
+constructs the graph in deterministic batches. It builds a 4,096-point seed
+graph serially,
 plans groups of 512 insertions in parallel against a stable graph snapshot, and
 then applies those plans in input order. Each Rayon worker reuses generation-
 marked visitation storage, avoiding a hash table allocation for every insertion.
+Queries draw generation-marked workspaces from a bounded contention-safe pool.
 Neighbor selection uses the HNSW diversity heuristic, with `2 * M` connections
 on the base layer and `M` above it. The persisted graph format remains compatible
 with graphs written before the contiguous in-memory layout was introduced.
+
+After construction, neighbor lists are flattened into `u32` links and compact
+ranges, and point IDs live in one ordinal table instead of being duplicated in
+graph nodes. Scalar-int8 dot products use runtime-dispatched AVX2 on supported
+x86-64 CPUs and a checked portable accumulator elsewhere.
 
 The following results were measured with 32 visible CPU cores on the benchmark's
 deterministic one-million-vector, 128-dimensional cosine corpus. Times are means
@@ -108,13 +140,137 @@ build time and memory; increasing only `ef_search` cannot recover recall that
 was lost during graph construction. Larger `M` also increases resident graph
 memory and full rebuild time.
 
+### Scalar-int8 graph storage and reranking
+
+Durable single-node and Raft indexes use per-vector symmetric scalar-int8
+quantization. Each node stores one signed byte per component plus a scale and
+cached squared norm. Graph traversal uses quantized cosine, dot-product, or
+Euclidean scores. Queries oversample four times the requested result count and
+rerank candidates against the authoritative full-precision vectors, so scores
+returned by durable APIs remain full-precision. Filtered exact-search and dirty
+delta paths also remain full-precision.
+
+Rebuilds quantize directly from validated snapshot vectors without cloning
+another full `f32` arena. Version-1 `f32` graphs remain readable; the next flush
+rewrites them using the version-2 representation.
+
+Release-mode measurements on the development i9-13900K produced:
+
+| Corpus | Storage | Vector arena | Build | Query at `ef=384` | Recall@10 |
+|---|---|---:|---:|---:|---:|
+| 100k × 128 | `f32` | 51.2 MB | 6.96 s | 1.077 ms | 96.3% |
+| 100k × 128 | scalar-int8 | 13.6 MB | 3.47 s | 0.316 ms | 95.1% |
+| 50k × 768 | `f32` | 153.6 MB | 16.03 s | 3.167 ms | 83.9% |
+| 50k × 768 | scalar-int8 | 38.8 MB | 3.85 s | 1.009 ms | 83.3% |
+
+These direct-HNSW recall figures exclude the durable API's full-precision
+four-times candidate reranking. Quantization materially reduces rebuild memory,
+construction time, and query latency on this AVX2 host. The portable fallback
+and other CPUs can have different construction tradeoffs, so both
+representations remain available to benchmark and library users.
+
 GPU indexing is not implemented in Focal Vector. At this scale, one million
 128-dimensional `f32` vectors occupy about 488 MiB, so deployments with a CUDA
 GPU should separately benchmark exact GPU search or a GPU-native graph index
 before committing to CPU HNSW. The CPU implementation remains useful when a GPU
 dependency is undesirable or the index must be served from ordinary hosts.
 
+## Operational readiness and limits
+
+Focal Vector is ready for daily dogfooding and beta use as FocalDesk's local,
+single-user semantic-search sidecar. Run it as a separate process over the Unix
+socket so indexing, compaction, and recovery work cannot block the desktop
+compositor. Keep source documents in their authoritative store and treat the
+vector collection as a durable but rebuildable search index.
+
+Before relying on a deployment, measure recall with its actual embedding model
+and query corpus. The default `M=16`, `ef_construction=200` profile favors build
+speed. For important 768-dimensional retrieval, test `M=32`,
+`ef_construction=400`, and `ef_search=384` against exact top-k results. Exact
+reranking corrects candidate order and scores, but cannot recover a relevant
+point that approximate traversal never selected.
+
+Recommended local-operation practices:
+
+- Enable periodic backups and verify that they restore before deleting source
+  data.
+- Bound Rayon threads, concurrent operations, and background-flush frequency so
+  interactive FocalDesk work retains CPU and I/O headroom.
+- Monitor mapped and owned points, pending IDs, segment count, query percentiles,
+  compaction time, disk space, and process RSS.
+- Leave temporary space for a complete compacted segment even though routine
+  flushes write only changed points and tombstones.
+- Benchmark cold starts and cold page-cache behavior; mapped pages consume OS
+  page cache even though they do not count as Rust heap allocations.
+
+Do not use Focal Vector as:
+
+- the canonical document store or a replacement for relational transactions,
+  joins, and general SQL;
+- a safety-critical exact-retrieval system where one missed candidate is
+  unacceptable;
+- an untrusted public multi-tenant service without additional authentication,
+  quotas, isolation, and abuse controls;
+- encrypted storage (use filesystem permissions and encrypted disks when data
+  at rest is sensitive);
+- proven cross-region disaster-recovery infrastructure; Raft support still
+  requires deployment-specific partition, failover, and restore testing;
+- a validated 100-million-vector solution—the target remains a hypothesis until
+  representative multi-million and 100-million-vector tests are completed.
+
+The remaining work is primarily operational hardening rather than another
+storage rewrite: long-running mixed read/write soak tests, disk-full and real
+power-loss fault injection, multi-million-vector cold-cache benchmarks,
+configurable HNSW construction parameters for durable collections, byte-aware
+compaction policies, and lower-overhead heap storage for IDs and metadata.
+
 ## Run the server
+
+### FocalDesk local sidecar
+
+Set `FOCAL_VECTOR_SOCKET` to disable the TCP listener and expose only the
+versioned Unix-socket API. The daemon creates the socket with mode `0600`,
+protects its parent directory with mode `0700`, verifies peer credentials, and
+accepts only clients running as the same user.
+
+```bash
+FOCAL_DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/focaldesk/vector" \
+FOCAL_VECTOR_SOCKET="$XDG_RUNTIME_DIR/focaldesk/focal-vector.sock" \
+RAYON_NUM_THREADS=4 \
+FOCAL_MAX_CONCURRENT_OPERATIONS=4 \
+cargo run --release --bin focal-server
+```
+
+`focal-vector-client` is a small blocking client crate with no dependency on
+the storage engine. Async FocalDesk services should call it through
+`tokio::task::spawn_blocking`. The client resolves `FOCAL_VECTOR_SOCKET` first
+and otherwise uses `$XDG_RUNTIME_DIR/focaldesk/focal-vector.sock`.
+
+```rust,no_run
+use focal_vector_client::{Client, Metric};
+
+let client = Client::from_environment()?;
+client.hello()?;
+if !client.list_collections()?.iter().any(|item| item.name == "memories") {
+    client.create_collection("memories", 768, Metric::Cosine)?;
+}
+# Ok::<(), focal_vector_client::Error>(())
+```
+
+For the initial desktop deployment, keep the vector daemon below the
+compositor and inference services in scheduling priority. Four Rayon threads
+and four admitted storage operations are conservative defaults for the
+32-thread development machine. A systemd user unit should additionally set a
+memory high-water mark appropriate for the embedding size (24 GiB is a safe
+starting point on a 64 GiB host), a hard maximum above it, and `Nice=10`.
+
+The integration boundary is `focaldesk-memory`: replace its current
+`sqlite-vec` calls with `focal-vector-client` calls while retaining text and
+authoritative relational metadata in SQLite. Store the SQLite memory ID as the
+Focal Vector point ID. Treat embeddings and the HNSW index as rebuildable data.
+The compositor remains unchanged.
+
+### TCP service
 
 ```bash
 FOCAL_DATA_DIR=./data \

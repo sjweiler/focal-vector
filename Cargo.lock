@@ -590,6 +590,8 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "axum-server",
+ "focal-vector-client",
+ "focal-vector-protocol",
  "memmap2",
  "openraft",
  "rayon",
@@ -601,6 +603,22 @@ dependencies = [
  "serde_json",
  "tokio",
  "tower",
+]
+
+[[package]]
+name = "focal-vector-client"
+version = "0.1.0"
+dependencies = [
+ "focal-vector-protocol",
+ "serde_json",
+]
+
+[[package]]
+name = "focal-vector-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

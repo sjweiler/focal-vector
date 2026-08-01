@@ -3,7 +3,9 @@ use std::env;
 use std::hint::black_box;
 use std::time::Instant;
 
-use focal_vector::{Collection, CollectionConfig, HnswConfig, HnswIndex, Metric, UpsertPoint};
+use focal_vector::{
+    Collection, CollectionConfig, HnswConfig, HnswIndex, HnswVectorStorage, Metric, UpsertPoint,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let point_count = argument(1, 10_000);
@@ -13,6 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let m = argument(5, HnswConfig::default().m);
     let ef_construction = argument(6, HnswConfig::default().ef_construction);
     let ef_search_values = ef_search_values(ef_search)?;
+    let storages = storages()?;
     let k = 10.min(point_count);
     if point_count == 0 || dimension == 0 || query_count == 0 {
         return Err("point count, dimension, and query count must be positive".into());
@@ -52,15 +55,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect(),
     )?;
 
-    let build_started = Instant::now();
-    let approximate = HnswIndex::build(
-        dimension,
-        Metric::Cosine,
-        HnswConfig { m, ef_construction },
-        points,
-    )?;
-    let build_elapsed = build_started.elapsed();
-
     let exact_started = Instant::now();
     let exact_results: Vec<Vec<String>> = queries
         .iter()
@@ -73,40 +67,69 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let exact_elapsed = exact_started.elapsed();
 
     println!(
-        "points={point_count} dimensions={dimension} queries={query_count} k={k} m={m} ef_construction={ef_construction}"
-    );
-    println!("hnsw_build_ms={:.2}", build_elapsed.as_secs_f64() * 1_000.0);
-    println!(
-        "exact_qps={:.1} exact_ms_per_query={:.3}",
+        "points={point_count} dimensions={dimension} queries={query_count} k={k} m={m} ef_construction={ef_construction} exact_qps={:.1} exact_ms_per_query={:.3}",
         query_count as f64 / exact_elapsed.as_secs_f64(),
         exact_elapsed.as_secs_f64() * 1_000.0 / query_count as f64
     );
-    for ef_search in ef_search_values {
-        let approximate_started = Instant::now();
-        let approximate_results: Vec<HashSet<String>> = queries
-            .iter()
-            .map(|query| {
-                approximate
-                    .search(query.clone(), k, ef_search.max(k))
-                    .map(|hits| hits.into_iter().map(|hit| hit.id).collect())
-            })
-            .collect::<Result<_, _>>()?;
-        let approximate_elapsed = approximate_started.elapsed();
-        let matches: usize = exact_results
-            .iter()
-            .zip(&approximate_results)
-            .map(|(expected, actual)| expected.iter().filter(|id| actual.contains(*id)).count())
-            .sum();
-        let recall = matches as f64 / (query_count * k) as f64;
-        black_box(&approximate_results);
+    for storage in storages {
+        let build_started = Instant::now();
+        let approximate = HnswIndex::build_with_storage(
+            dimension,
+            Metric::Cosine,
+            HnswConfig { m, ef_construction },
+            storage,
+            points.clone(),
+        )?;
+        let build_elapsed = build_started.elapsed();
+        let stats = approximate.stats();
         println!(
-            "ef_search={ef_search} hnsw_qps={:.1} hnsw_ms_per_query={:.3} recall_at_{k}={recall:.4}",
-            query_count as f64 / approximate_elapsed.as_secs_f64(),
-            approximate_elapsed.as_secs_f64() * 1_000.0 / query_count as f64
+            "storage={storage:?} vector_storage_bytes={} graph_layers={} graph_links={} id_bytes={} hnsw_build_ms={:.2}",
+            approximate.vector_storage_bytes(),
+            stats.layers,
+            stats.links,
+            stats.id_bytes,
+            build_elapsed.as_secs_f64() * 1_000.0
         );
+        for &ef_search in &ef_search_values {
+            let approximate_started = Instant::now();
+            let approximate_results: Vec<HashSet<String>> = queries
+                .iter()
+                .map(|query| {
+                    approximate
+                        .search(query.clone(), k, ef_search.max(k))
+                        .map(|hits| hits.into_iter().map(|hit| hit.id).collect())
+                })
+                .collect::<Result<_, _>>()?;
+            let approximate_elapsed = approximate_started.elapsed();
+            let matches: usize = exact_results
+                .iter()
+                .zip(&approximate_results)
+                .map(|(expected, actual)| expected.iter().filter(|id| actual.contains(*id)).count())
+                .sum();
+            let recall = matches as f64 / (query_count * k) as f64;
+            black_box(&approximate_results);
+            println!(
+                "storage={storage:?} ef_search={ef_search} hnsw_qps={:.1} hnsw_ms_per_query={:.3} recall_at_{k}={recall:.4}",
+                query_count as f64 / approximate_elapsed.as_secs_f64(),
+                approximate_elapsed.as_secs_f64() * 1_000.0 / query_count as f64
+            );
+        }
     }
     black_box(&exact_results);
     Ok(())
+}
+
+fn storages() -> Result<Vec<HnswVectorStorage>, Box<dyn std::error::Error>> {
+    match env::var("FOCAL_BENCH_STORAGE") {
+        Ok(value) if value == "int8" => Ok(vec![HnswVectorStorage::ScalarInt8]),
+        Ok(value) if value == "f32" => Ok(vec![HnswVectorStorage::F32]),
+        Ok(value) if value == "both" => {
+            Ok(vec![HnswVectorStorage::F32, HnswVectorStorage::ScalarInt8])
+        }
+        Ok(_) => Err("FOCAL_BENCH_STORAGE must be 'f32', 'int8', or 'both'".into()),
+        Err(env::VarError::NotPresent) => Ok(vec![HnswVectorStorage::F32]),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn ef_search_values(default: usize) -> Result<Vec<usize>, Box<dyn std::error::Error>> {

@@ -2,14 +2,17 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use memmap2::MmapOptions;
 
+use crate::collection::{PointVector, StoredPoint};
 use crate::metadata_index::MetadataIndex;
 use crate::{
-    Collection, CollectionConfig, Error, Filter, HnswConfig, HnswIndex, Metric, Point, Result,
-    SearchHit, UpsertPoint, Value,
+    Collection, CollectionConfig, Error, Filter, HnswConfig, HnswIndex, HnswVectorStorage, Metric,
+    Result, SearchHit, UpsertPoint, Value,
 };
 
 const META_MAGIC: &[u8; 4] = b"FVMT";
@@ -17,9 +20,13 @@ const WAL_MAGIC: &[u8; 4] = b"FVWL";
 const SEGMENT_MAGIC: &[u8; 4] = b"FVSG";
 const MANIFEST_MAGIC: &[u8; 4] = b"FVMF";
 const FORMAT_VERSION: u8 = 1;
-const SEGMENT_VERSION: u8 = 2;
+const SEGMENT_VERSION: u8 = 3;
+const LEGACY_SEGMENT_VERSION: u8 = 2;
+const MANIFEST_LIST_VERSION: u8 = 2;
+const MAX_INDEX_SEGMENTS: usize = 8;
 const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
 const MAX_ITEMS: usize = 1_000_000;
+static TEMPORARY_SEGMENT_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Durability {
@@ -30,6 +37,19 @@ pub enum Durability {
     Flush,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PersistentIndexStats {
+    pub segments: usize,
+    pub nodes: usize,
+    pub links: usize,
+    pub vector_heap_bytes: usize,
+    pub mapped_segments: usize,
+    pub pending_ids: usize,
+    pub mapped_points: usize,
+    pub owned_points: usize,
+    pub owned_vector_bytes: usize,
+}
+
 #[derive(Debug)]
 pub struct PersistentCollection {
     _lock: File,
@@ -37,22 +57,53 @@ pub struct PersistentCollection {
     wal: File,
     durability: Durability,
     directory: PathBuf,
-    index: Option<HnswIndex>,
+    indexes: Vec<IndexSegment>,
     metadata_index: Option<MetadataIndex>,
     dirty_ids: HashSet<String>,
 }
 
 pub(crate) struct FlushSnapshot {
+    directory: PathBuf,
     config: CollectionConfig,
     sequence: u64,
-    points: Vec<Point>,
+    points: Vec<StoredPoint>,
+    graph_points: Vec<StoredPoint>,
+    tombstones: Vec<String>,
+    compact: bool,
+}
+
+#[derive(Debug)]
+struct IndexSegment {
+    sequence: u64,
+    index: HnswIndex,
+}
+
+#[derive(Debug, Clone)]
+struct Manifest {
+    sequence: u64,
+    segments: Vec<String>,
 }
 
 pub(crate) struct PreparedFlush {
     sequence: u64,
-    bytes: Vec<u8>,
+    temporary_segment: PathBuf,
+    metadata_index: Option<MetadataIndex>,
+    compact: bool,
+}
+
+struct DecodedSegment {
+    config: CollectionConfig,
+    sequence: u64,
+    points: Vec<StoredPoint>,
+    tombstones: Vec<String>,
     index: HnswIndex,
-    metadata_index: MetadataIndex,
+    full: bool,
+}
+
+impl Drop for PreparedFlush {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.temporary_segment);
+    }
 }
 
 impl PersistentCollection {
@@ -87,10 +138,10 @@ impl PersistentCollection {
             .append(true)
             .open(wal_path)?;
         let mut inner = Collection::new(config)?;
-        let loaded = load_current_segment(&directory, &mut inner)?;
-        let (index, metadata_index) = loaded
-            .map(|(index, metadata)| (Some(index), Some(metadata)))
-            .unwrap_or((None, None));
+        let loaded = load_current_segments(&directory, &mut inner)?;
+        let (indexes, metadata_index) = loaded
+            .map(|(indexes, metadata)| (indexes, Some(metadata)))
+            .unwrap_or_default();
         let mut dirty_ids = HashSet::new();
         recover(&mut wal, &mut inner, &mut dirty_ids)?;
         wal.seek(SeekFrom::End(0))?;
@@ -101,7 +152,7 @@ impl PersistentCollection {
             wal,
             durability,
             directory,
-            index,
+            indexes,
             metadata_index,
             dirty_ids,
         })
@@ -206,25 +257,35 @@ impl PersistentCollection {
             return Ok(merge_hits(hits, k));
         }
 
-        let Some(index) = self.index.as_ref() else {
+        if self.indexes.is_empty() {
             return self.inner.search(query, k, None);
-        };
-        let graph_k = k.saturating_add(self.dirty_ids.len()).min(index.len());
-        let mut hits = Vec::with_capacity(k.saturating_add(self.dirty_ids.len()));
-        if graph_k > 0 {
-            for hit in index.search(query.clone(), graph_k, ef_search.max(graph_k))? {
-                if self.dirty_ids.contains(&hit.id) {
+        }
+        let mut hits = Vec::with_capacity(k.saturating_mul(self.indexes.len() + 1));
+        let metric = self.inner.config().metric;
+        let prepared_query = metric.prepare(query.clone())?;
+        for segment in &self.indexes {
+            let rerank_k = if segment.index.vector_storage() == HnswVectorStorage::ScalarInt8 {
+                k.saturating_mul(4)
+            } else {
+                k
+            };
+            let graph_k = rerank_k.min(segment.index.len());
+            if graph_k == 0 {
+                continue;
+            }
+            for hit in segment
+                .index
+                .search(query.clone(), graph_k, ef_search.max(graph_k))?
+            {
+                let Some(point) = self.inner.get_stored(&hit.id) else {
+                    continue;
+                };
+                if self.dirty_ids.contains(&hit.id) || point.sequence > segment.sequence {
                     continue;
                 }
-                let point = self.inner.get(&hit.id).ok_or_else(|| {
-                    Error::CorruptStorage(format!(
-                        "HNSW point {} is missing from its segment",
-                        hit.id
-                    ))
-                })?;
                 hits.push(SearchHit {
                     id: hit.id,
-                    score: hit.score,
+                    score: metric.score(&prepared_query, &point.vector),
                     metadata: point.metadata.clone(),
                     sequence: point.sequence,
                 });
@@ -235,11 +296,36 @@ impl PersistentCollection {
     }
 
     pub fn has_approximate_index(&self) -> bool {
-        self.index.is_some()
+        !self.indexes.is_empty()
     }
 
     pub fn pending_point_count(&self) -> usize {
         self.dirty_ids.len()
+    }
+
+    pub fn index_stats(&self) -> PersistentIndexStats {
+        let (mapped_points, owned_points, owned_vector_bytes) = self.inner.vector_storage_stats();
+        self.indexes.iter().fold(
+            PersistentIndexStats {
+                segments: self.indexes.len(),
+                nodes: 0,
+                links: 0,
+                vector_heap_bytes: 0,
+                mapped_segments: 0,
+                pending_ids: self.dirty_ids.len(),
+                mapped_points,
+                owned_points,
+                owned_vector_bytes,
+            },
+            |mut total, segment| {
+                let stats = segment.index.stats();
+                total.nodes += stats.nodes;
+                total.links += stats.links;
+                total.vector_heap_bytes += stats.vector_heap_bytes;
+                total.mapped_segments += usize::from(stats.vectors_memory_mapped);
+                total
+            },
+        )
     }
 
     pub(crate) fn copy_backup_to(&self, destination: &Path) -> Result<()> {
@@ -258,59 +344,118 @@ impl PersistentCollection {
     /// durable before the next. A crash at any boundary therefore recovers
     /// from either the old log or the newly published segment.
     pub fn flush(&mut self) -> Result<u64> {
+        if self.dirty_ids.is_empty() && !self.indexes.is_empty() {
+            return Ok(self.inner.latest_sequence());
+        }
         let snapshot = self.flush_snapshot();
         let prepared = Self::build_flush(snapshot)?;
         self.publish_flush(prepared)
     }
 
     pub(crate) fn flush_snapshot(&self) -> FlushSnapshot {
+        let points = self.inner.snapshot_stored_points();
+        let compact = self.indexes.is_empty() || self.indexes.len() >= MAX_INDEX_SEGMENTS;
+        let graph_points = if compact {
+            points.clone()
+        } else {
+            points
+                .iter()
+                .filter(|point| self.dirty_ids.contains(&point.id))
+                .cloned()
+                .collect()
+        };
+        let tombstones = if compact {
+            Vec::new()
+        } else {
+            self.dirty_ids
+                .iter()
+                .filter(|id| self.inner.get_stored(id).is_none())
+                .cloned()
+                .collect()
+        };
         FlushSnapshot {
+            directory: self.directory.clone(),
             config: self.inner.config(),
             sequence: self.inner.latest_sequence(),
-            points: self.inner.snapshot_points(),
+            points,
+            graph_points,
+            tombstones,
+            compact,
         }
     }
 
     pub(crate) fn build_flush(snapshot: FlushSnapshot) -> Result<PreparedFlush> {
         let metadata_index = MetadataIndex::build(&snapshot.points);
-        let index = HnswIndex::build(
+        let index = HnswIndex::build_quantized_prepared(
             snapshot.config.dimension,
             snapshot.config.metric,
             HnswConfig::default(),
             snapshot
-                .points
+                .graph_points
                 .iter()
-                .map(|point| (point.id.clone(), point.vector.clone())),
+                .map(|point| (point.id.clone(), point.vector.as_slice())),
         )?;
-        let bytes = encode_segment(snapshot.config, snapshot.sequence, &snapshot.points, &index)?;
+        let temporary_segment = temporary_segment_path(&snapshot.directory, snapshot.sequence);
+        let segment_points = if snapshot.compact {
+            &snapshot.points
+        } else {
+            &snapshot.graph_points
+        };
+        write_segment_file(
+            &temporary_segment,
+            snapshot.config,
+            snapshot.sequence,
+            segment_points,
+            &snapshot.tombstones,
+            snapshot.compact,
+            &index,
+        )?;
         Ok(PreparedFlush {
             sequence: snapshot.sequence,
-            bytes,
-            index,
-            metadata_index,
+            temporary_segment,
+            metadata_index: Some(metadata_index),
+            compact: snapshot.compact,
         })
     }
 
-    pub(crate) fn publish_flush(&mut self, prepared: PreparedFlush) -> Result<u64> {
+    pub(crate) fn publish_flush(&mut self, mut prepared: PreparedFlush) -> Result<u64> {
         let previous = read_manifest(&self.directory)?;
-        if let Some((published_sequence, _)) = &previous
-            && *published_sequence > prepared.sequence
+        if let Some(manifest) = &previous
+            && manifest.sequence > prepared.sequence
         {
-            return Ok(*published_sequence);
+            return Ok(manifest.sequence);
         }
 
         let sequence = prepared.sequence;
         let segment_name = format!("segment-{sequence:020}.fvs");
         let segment_path = self.directory.join(&segment_name);
-        let temporary_segment = self
-            .directory
-            .join(format!(".{segment_name}.tmp-{}", std::process::id()));
-
-        write_new_file(&temporary_segment, &prepared.bytes)?;
-        fs::rename(&temporary_segment, &segment_path)?;
+        fs::rename(&prepared.temporary_segment, &segment_path)?;
         sync_directory(&self.directory)?;
+        let segment = File::open(&segment_path)?;
+        // SAFETY: The freshly renamed segment is immutable from this point.
+        let mapping = Arc::new(unsafe { MmapOptions::new().map(&segment)? });
+        let decoded = decode_segment_mapped(mapping)?;
+        if decoded.config != self.inner.config()
+            || decoded.sequence != sequence
+            || decoded.full != prepared.compact
+        {
+            return Err(Error::CorruptStorage(
+                "prepared segment changed before publication".into(),
+            ));
+        }
 
-        publish_manifest(&self.directory, sequence, &segment_name)?;
+        let mut segment_names = if prepared.compact {
+            Vec::new()
+        } else {
+            previous
+                .as_ref()
+                .map(|manifest| manifest.segments.clone())
+                .unwrap_or_default()
+        };
+        segment_names.push(segment_name.clone());
+        publish_manifest(&self.directory, sequence, &segment_names)?;
+
+        self.inner.replace_persisted_points(decoded.points);
 
         if self.inner.latest_sequence() == sequence {
             self.wal.set_len(0)?;
@@ -319,13 +464,25 @@ impl PersistentCollection {
             self.dirty_ids.clear();
         }
 
-        if let Some((_, previous_name)) = previous
-            && previous_name != segment_name
-        {
-            let _ = fs::remove_file(self.directory.join(previous_name));
+        if prepared.compact {
+            // Release mappings before unlinking their immutable files. Unix
+            // permits unlinking mapped files, but Windows does not.
+            self.indexes.clear();
+            if let Some(previous) = previous {
+                for previous_name in previous.segments {
+                    if previous_name != segment_name {
+                        let _ = fs::remove_file(self.directory.join(previous_name));
+                    }
+                }
+            }
         }
-        self.index = Some(prepared.index);
-        self.metadata_index = Some(prepared.metadata_index);
+        if !decoded.index.is_empty() {
+            self.indexes.push(IndexSegment {
+                sequence,
+                index: decoded.index,
+            });
+        }
+        self.metadata_index = prepared.metadata_index.take();
         Ok(sequence)
     }
 
@@ -395,8 +552,10 @@ fn copy_collection_directory(source: &Path, destination: &Path) -> Result<()> {
             &temporary.join("collection.meta"),
         )?;
         copy_and_sync(&source.join("write.wal"), &temporary.join("write.wal"))?;
-        if let Some((_, segment_name)) = read_manifest(source)? {
-            copy_and_sync(&source.join(&segment_name), &temporary.join(&segment_name))?;
+        if let Some(manifest) = read_manifest(source)? {
+            for segment_name in &manifest.segments {
+                copy_and_sync(&source.join(segment_name), &temporary.join(segment_name))?;
+            }
             copy_and_sync(&source.join("MANIFEST"), &temporary.join("MANIFEST"))?;
         }
         sync_directory(&temporary)?;
@@ -415,12 +574,15 @@ fn copy_and_sync(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-fn publish_manifest(directory: &Path, sequence: u64, segment_name: &str) -> Result<()> {
+fn publish_manifest(directory: &Path, sequence: u64, segment_names: &[String]) -> Result<()> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(MANIFEST_MAGIC);
-    bytes.push(FORMAT_VERSION);
+    bytes.push(MANIFEST_LIST_VERSION);
     bytes.extend_from_slice(&sequence.to_le_bytes());
-    put_string(&mut bytes, segment_name)?;
+    put_count(&mut bytes, segment_names.len())?;
+    for segment_name in segment_names {
+        put_string(&mut bytes, segment_name)?;
+    }
     let checksum = crc32c(&bytes);
     bytes.extend_from_slice(&checksum.to_le_bytes());
 
@@ -430,14 +592,17 @@ fn publish_manifest(directory: &Path, sequence: u64, segment_name: &str) -> Resu
     sync_directory(directory)
 }
 
-fn read_manifest(directory: &Path) -> Result<Option<(u64, String)>> {
+fn read_manifest(directory: &Path) -> Result<Option<Manifest>> {
     let path = directory.join("MANIFEST");
     if !path.exists() {
         return Ok(None);
     }
     let mut bytes = Vec::new();
     File::open(path)?.read_to_end(&mut bytes)?;
-    if bytes.len() < 21 || &bytes[..4] != MANIFEST_MAGIC || bytes[4] != FORMAT_VERSION {
+    if bytes.len() < 21
+        || &bytes[..4] != MANIFEST_MAGIC
+        || !matches!(bytes[4], FORMAT_VERSION | MANIFEST_LIST_VERSION)
+    {
         return Err(Error::CorruptStorage("invalid manifest header".into()));
     }
     let payload_length = bytes.len() - 4;
@@ -451,46 +616,96 @@ fn read_manifest(directory: &Path) -> Result<Option<(u64, String)>> {
     }
     let mut decoder = Decoder::new(&bytes[5..payload_length]);
     let sequence = decoder.u64()?;
-    let segment_name = decoder.string()?;
+    let segment_names = if bytes[4] == FORMAT_VERSION {
+        vec![decoder.string()?]
+    } else {
+        let count = decoder.count()?;
+        if count == 0 || count > MAX_INDEX_SEGMENTS + 1 {
+            return Err(Error::CorruptStorage(
+                "invalid segment count in manifest".into(),
+            ));
+        }
+        let mut names = Vec::with_capacity(count);
+        for _ in 0..count {
+            names.push(decoder.string()?);
+        }
+        names
+    };
     decoder.finish()?;
-    if segment_name.contains('/') || !segment_name.starts_with("segment-") {
-        return Err(Error::CorruptStorage(
-            "invalid segment name in manifest".into(),
-        ));
+    let mut unique = HashSet::with_capacity(segment_names.len());
+    for segment_name in &segment_names {
+        if segment_name.contains('/')
+            || !segment_name.starts_with("segment-")
+            || !unique.insert(segment_name)
+        {
+            return Err(Error::CorruptStorage(
+                "invalid segment name in manifest".into(),
+            ));
+        }
     }
-    Ok(Some((sequence, segment_name)))
+    Ok(Some(Manifest {
+        sequence,
+        segments: segment_names,
+    }))
 }
 
-fn load_current_segment(
+fn load_current_segments(
     directory: &Path,
     collection: &mut Collection,
-) -> Result<Option<(HnswIndex, MetadataIndex)>> {
-    let Some((manifest_sequence, segment_name)) = read_manifest(directory)? else {
+) -> Result<Option<(Vec<IndexSegment>, MetadataIndex)>> {
+    let Some(manifest) = read_manifest(directory)? else {
         return Ok(None);
     };
-    let segment = File::open(directory.join(segment_name))?;
-    if segment.metadata()?.len() == 0 {
-        return Err(Error::CorruptStorage("segment file is empty".into()));
+    let mut indexes = Vec::with_capacity(manifest.segments.len());
+    let mut previous_sequence = 0;
+    for (position, segment_name) in manifest.segments.iter().enumerate() {
+        let segment = File::open(directory.join(segment_name))?;
+        if segment.metadata()?.len() == 0 {
+            return Err(Error::CorruptStorage("segment file is empty".into()));
+        }
+        // SAFETY: Published segment files are immutable and retired only after
+        // a replacement manifest is durable.
+        let bytes = Arc::new(unsafe { MmapOptions::new().map(&segment)? });
+        let decoded = decode_segment_mapped(Arc::clone(&bytes))?;
+        if decoded.config != collection.config() {
+            return Err(Error::CorruptStorage(
+                "segment configuration differs from collection metadata".into(),
+            ));
+        }
+        if position == 0 && !decoded.full {
+            return Err(Error::CorruptStorage(
+                "manifest does not begin with a full segment".into(),
+            ));
+        }
+        if position > 0 && (decoded.full || decoded.sequence <= previous_sequence) {
+            return Err(Error::CorruptStorage(
+                "manifest segments are not ordered deltas".into(),
+            ));
+        }
+        previous_sequence = decoded.sequence;
+        if position + 1 == manifest.segments.len() && decoded.sequence != manifest.sequence {
+            return Err(Error::CorruptStorage(
+                "manifest and latest segment sequences differ".into(),
+            ));
+        }
+        if decoded.full {
+            collection.restore_stored_snapshot(decoded.points, decoded.sequence)?;
+        } else {
+            if !decoded.points.is_empty() {
+                collection.apply_prepared_upsert(decoded.points, decoded.sequence);
+            }
+            collection.apply_delete_at(&decoded.tombstones, decoded.sequence);
+        }
+        if !decoded.index.is_empty() {
+            indexes.push(IndexSegment {
+                sequence: decoded.sequence,
+                index: decoded.index,
+            });
+        }
     }
-    // SAFETY: Published segment files are immutable. This engine replaces
-    // manifests and segment pathnames atomically and never mutates a published
-    // segment inode. The map lives only for decoding and is dropped before any
-    // obsolete segment can be retired by this collection instance.
-    let bytes = unsafe { MmapOptions::new().map(&segment)? };
-    let (config, sequence, points, index) = decode_segment(&bytes)?;
-    if config != collection.config() {
-        return Err(Error::CorruptStorage(
-            "segment configuration differs from collection metadata".into(),
-        ));
-    }
-    if sequence != manifest_sequence {
-        return Err(Error::CorruptStorage(
-            "manifest and segment sequences differ".into(),
-        ));
-    }
+    let points = collection.snapshot_stored_points();
     let metadata_index = MetadataIndex::build(&points);
-    collection.restore_snapshot(points, sequence)?;
-    Ok(Some((index, metadata_index)))
+    Ok(Some((indexes, metadata_index)))
 }
 
 fn merge_hits(mut hits: Vec<SearchHit>, k: usize) -> Vec<SearchHit> {
@@ -505,43 +720,90 @@ fn merge_hits(mut hits: Vec<SearchHit>, k: usize) -> Vec<SearchHit> {
     hits
 }
 
-fn encode_segment(
-    config: CollectionConfig,
-    sequence: u64,
-    points: &[Point],
-    index: &HnswIndex,
-) -> Result<Vec<u8>> {
-    let mut output = Vec::new();
-    output.extend_from_slice(SEGMENT_MAGIC);
-    output.push(SEGMENT_VERSION);
-    output.push(metric_tag(config.metric));
-    output.extend_from_slice(&(config.dimension as u64).to_le_bytes());
-    output.extend_from_slice(&sequence.to_le_bytes());
-    put_count(&mut output, points.len())?;
-    for point in points {
-        put_string(&mut output, &point.id)?;
-        output.extend_from_slice(&point.sequence.to_le_bytes());
-        for value in &point.vector {
-            output.extend_from_slice(&value.to_le_bytes());
-        }
-        put_count(&mut output, point.metadata.len())?;
-        for (key, value) in &point.metadata {
-            put_string(&mut output, key)?;
-            encode_value(&mut output, value)?;
-        }
-    }
-    let graph = index.encode()?;
-    put_count(&mut output, graph.len())?;
-    output.extend_from_slice(&graph);
-    let checksum = crc32c(&output);
-    output.extend_from_slice(&checksum.to_le_bytes());
-    Ok(output)
+fn temporary_segment_path(directory: &Path, sequence: u64) -> PathBuf {
+    let nonce = TEMPORARY_SEGMENT_NONCE.fetch_add(1, AtomicOrdering::Relaxed);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    directory.join(format!(
+        ".segment-{sequence:020}.tmp-{}-{timestamp}-{nonce}",
+        std::process::id()
+    ))
 }
 
-fn decode_segment(bytes: &[u8]) -> Result<(CollectionConfig, u64, Vec<Point>, HnswIndex)> {
-    if bytes.len() < 30 || &bytes[..4] != SEGMENT_MAGIC || bytes[4] != SEGMENT_VERSION {
+fn write_segment_file(
+    path: &Path,
+    config: CollectionConfig,
+    sequence: u64,
+    points: &[StoredPoint],
+    tombstones: &[String],
+    full: bool,
+    index: &HnswIndex,
+) -> Result<()> {
+    let result = (|| {
+        let file = OpenOptions::new().create_new(true).write(true).open(path)?;
+        let mut output = Crc32cWriter::new(file);
+        output.write_all(SEGMENT_MAGIC)?;
+        output.write_all(&[SEGMENT_VERSION])?;
+        output.write_all(&[metric_tag(config.metric)])?;
+        output.write_all(&(config.dimension as u64).to_le_bytes())?;
+        output.write_all(&sequence.to_le_bytes())?;
+        output.write_all(&[u8::from(!full)])?;
+        put_count_writer(&mut output, points.len())?;
+        for point in points {
+            put_string_writer(&mut output, &point.id)?;
+            output.write_all(&point.sequence.to_le_bytes())?;
+            let padding = (4 - ((output.position() + 1) % 4)) % 4;
+            output.write_all(&[padding as u8])?;
+            output.write_all(&[0; 3][..padding])?;
+            for value in &point.vector {
+                output.write_all(&value.to_le_bytes())?;
+            }
+            put_count_writer(&mut output, point.metadata.len())?;
+            for (key, value) in &point.metadata {
+                put_string_writer(&mut output, key)?;
+                encode_value_writer(&mut output, value)?;
+            }
+        }
+        put_count_writer(&mut output, tombstones.len())?;
+        for id in tombstones {
+            put_string_writer(&mut output, id)?;
+        }
+        let graph_length = index.encoded_len()?;
+        put_count_writer(&mut output, graph_length)?;
+        index.encode_into(&mut output)?;
+        let (mut file, checksum) = output.finish();
+        file.write_all(&checksum.to_le_bytes())?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(path);
+    }
+    result
+}
+
+#[cfg(test)]
+fn decode_segment(bytes: &[u8]) -> Result<DecodedSegment> {
+    decode_segment_inner(bytes, None)
+}
+
+fn decode_segment_mapped(mapping: Arc<memmap2::Mmap>) -> Result<DecodedSegment> {
+    decode_segment_inner(&mapping, Some(Arc::clone(&mapping)))
+}
+
+fn decode_segment_inner(
+    bytes: &[u8],
+    mapping: Option<Arc<memmap2::Mmap>>,
+) -> Result<DecodedSegment> {
+    if bytes.len() < 30
+        || &bytes[..4] != SEGMENT_MAGIC
+        || !matches!(bytes[4], LEGACY_SEGMENT_VERSION | SEGMENT_VERSION)
+    {
         return Err(Error::CorruptStorage("invalid segment header".into()));
     }
+    let version = bytes[4];
     let payload_length = bytes.len() - 4;
     let stored_crc = u32::from_le_bytes(
         bytes[payload_length..]
@@ -560,31 +822,109 @@ fn decode_segment(bytes: &[u8]) -> Result<(CollectionConfig, u64, Vec<Point>, Hn
     }
     let mut decoder = Decoder::new(&bytes[14..payload_length]);
     let sequence = decoder.u64()?;
+    let full = if version == SEGMENT_VERSION {
+        match decoder.byte()? {
+            0 => true,
+            1 => false,
+            _ => return Err(Error::CorruptStorage("invalid segment kind".into())),
+        }
+    } else {
+        true
+    };
     let count = decoder.count()?;
     let mut points = Vec::with_capacity(count);
     for _ in 0..count {
         let id = decoder.string()?;
         let point_sequence = decoder.u64()?;
-        let mut vector = Vec::with_capacity(dimension);
-        for _ in 0..dimension {
-            vector.push(decoder.f32()?);
-        }
+        let vector = if version == SEGMENT_VERSION {
+            let padding = decoder.byte()? as usize;
+            if padding > 3 || decoder.take(padding)?.iter().any(|byte| *byte != 0) {
+                return Err(Error::CorruptStorage(
+                    "invalid vector alignment padding".into(),
+                ));
+            }
+            let vector_offset = 14_usize
+                .checked_add(decoder.position)
+                .ok_or_else(|| Error::CorruptStorage("vector offset overflow".into()))?;
+            let vector_bytes =
+                decoder.take(dimension.checked_mul(4).ok_or_else(|| {
+                    Error::CorruptStorage("vector byte length overflows".into())
+                })?)?;
+            if let Some(mapping) = mapping.as_ref().filter(|_| cfg!(target_endian = "little")) {
+                let vector = PointVector::mapped(Arc::clone(mapping), vector_offset, dimension)?;
+                if vector.iter().any(|value| !value.is_finite()) {
+                    return Err(Error::CorruptStorage(
+                        "segment contains a non-finite vector".into(),
+                    ));
+                }
+                vector
+            } else {
+                let mut vector = Vec::with_capacity(dimension);
+                for bytes in vector_bytes.chunks_exact(4) {
+                    let value = f32::from_le_bytes(bytes.try_into().expect("fixed slice"));
+                    if !value.is_finite() {
+                        return Err(Error::CorruptStorage(
+                            "segment contains a non-finite vector".into(),
+                        ));
+                    }
+                    vector.push(value);
+                }
+                vector.into()
+            }
+        } else {
+            let mut vector = Vec::with_capacity(dimension);
+            for _ in 0..dimension {
+                vector.push(decoder.f32()?);
+            }
+            vector.into()
+        };
         let metadata_count = decoder.count()?;
         let mut metadata = BTreeMap::new();
         for _ in 0..metadata_count {
             metadata.insert(decoder.string()?, decoder.value()?);
         }
-        points.push(Point {
+        points.push(StoredPoint {
             id,
             vector,
             metadata,
             sequence: point_sequence,
+            public_view: OnceLock::new(),
         });
     }
+    let tombstones = if version == SEGMENT_VERSION {
+        let count = decoder.count()?;
+        let mut tombstones = Vec::with_capacity(count);
+        let mut seen = HashSet::with_capacity(count);
+        for _ in 0..count {
+            let id = decoder.string()?;
+            if id.is_empty() || !seen.insert(id.clone()) {
+                return Err(Error::CorruptStorage(
+                    "segment contains an empty or duplicate tombstone".into(),
+                ));
+            }
+            tombstones.push(id);
+        }
+        tombstones
+    } else {
+        Vec::new()
+    };
+    if full && !tombstones.is_empty() {
+        return Err(Error::CorruptStorage(
+            "full segment contains tombstones".into(),
+        ));
+    }
     let graph_length = decoder.u32()? as usize;
-    let index = HnswIndex::decode(decoder.take(graph_length)?)?;
+    let graph_offset = 14_usize
+        .checked_add(decoder.position)
+        .ok_or_else(|| Error::CorruptStorage("segment graph offset overflow".into()))?;
+    let graph_bytes = decoder.take(graph_length)?;
+    let index = if let Some(mapping) = mapping {
+        HnswIndex::decode_mapped(graph_bytes, mapping, graph_offset)?
+    } else {
+        HnswIndex::decode(graph_bytes)?
+    };
     decoder.finish()?;
-    if index.dimension() != dimension || index.metric() != metric || index.len() != points.len() {
+    if index.dimension() != dimension || index.metric() != metric || index.len() > points.len() {
         return Err(Error::CorruptStorage(
             "HNSW graph does not match its segment".into(),
         ));
@@ -592,17 +932,19 @@ fn decode_segment(bytes: &[u8]) -> Result<(CollectionConfig, u64, Vec<Point>, Hn
     let point_ids: std::collections::BTreeSet<&str> =
         points.iter().map(|point| point.id.as_str()).collect();
     let index_ids: std::collections::BTreeSet<&str> = index.ids().collect();
-    if point_ids != index_ids {
+    if index_ids != point_ids {
         return Err(Error::CorruptStorage(
             "HNSW graph IDs do not match its segment".into(),
         ));
     }
-    Ok((
-        CollectionConfig { dimension, metric },
+    Ok(DecodedSegment {
+        config: CollectionConfig { dimension, metric },
         sequence,
         points,
+        tombstones,
         index,
-    ))
+        full,
+    })
 }
 
 fn ensure_metadata(directory: &Path, config: CollectionConfig) -> Result<()> {
@@ -734,7 +1076,7 @@ fn read_exact_or_eof(reader: &mut File, buffer: &mut [u8]) -> Result<ReadState> 
     Ok(ReadState::Complete)
 }
 
-fn encode_upsert(sequence: u64, points: &[Point]) -> Result<Vec<u8>> {
+fn encode_upsert(sequence: u64, points: &[StoredPoint]) -> Result<Vec<u8>> {
     let mut output = Vec::new();
     output.push(1);
     output.extend_from_slice(&sequence.to_le_bytes());
@@ -871,6 +1213,75 @@ fn encode_value(output: &mut Vec<u8>, value: &Value) -> Result<()> {
     Ok(())
 }
 
+fn put_count_writer(output: &mut impl Write, count: usize) -> Result<()> {
+    let count = u32::try_from(count).map_err(|_| Error::InvalidQuery("batch is too large"))?;
+    output.write_all(&count.to_le_bytes())?;
+    Ok(())
+}
+
+fn put_string_writer(output: &mut impl Write, value: &str) -> Result<()> {
+    put_count_writer(output, value.len())?;
+    output.write_all(value.as_bytes())?;
+    Ok(())
+}
+
+fn encode_value_writer(output: &mut impl Write, value: &Value) -> Result<()> {
+    match value {
+        Value::Keyword(value) => {
+            output.write_all(&[1])?;
+            put_string_writer(output, value)?;
+        }
+        Value::Integer(value) => {
+            output.write_all(&[2])?;
+            output.write_all(&value.to_le_bytes())?;
+        }
+        Value::Float(value) if value.is_finite() => {
+            output.write_all(&[3])?;
+            output.write_all(&value.to_le_bytes())?;
+        }
+        Value::Float(_) => return Err(Error::InvalidQuery("metadata floats must be finite")),
+        Value::Boolean(value) => output.write_all(&[4, u8::from(*value)])?,
+    }
+    Ok(())
+}
+
+struct Crc32cWriter<W> {
+    inner: W,
+    crc: u32,
+    position: usize,
+}
+
+impl<W> Crc32cWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            crc: !0,
+            position: 0,
+        }
+    }
+
+    fn finish(self) -> (W, u32) {
+        (self.inner, !self.crc)
+    }
+
+    fn position(&self) -> usize {
+        self.position
+    }
+}
+
+impl<W: Write> Write for Crc32cWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(bytes)?;
+        self.crc = crc32c_update(self.crc, &bytes[..written]);
+        self.position = self.position.saturating_add(written);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 struct Decoder<'a> {
     bytes: &'a [u8],
     position: usize,
@@ -986,14 +1397,17 @@ fn parse_metric(tag: u8) -> Result<Metric> {
 }
 
 fn crc32c(bytes: &[u8]) -> u32 {
-    let mut crc = !0_u32;
+    !crc32c_update(!0, bytes)
+}
+
+fn crc32c_update(mut crc: u32, bytes: &[u8]) -> u32 {
     for &byte in bytes {
         crc ^= u32::from(byte);
         for _ in 0..8 {
             crc = (crc >> 1) ^ (0x82f6_3b78 & (0_u32.wrapping_sub(crc & 1)));
         }
     }
-    !crc
+    crc
 }
 
 #[cfg(test)]
@@ -1139,6 +1553,10 @@ mod tests {
             assert!(!collection.has_approximate_index());
             assert_eq!(collection.flush().unwrap(), 1);
             assert!(collection.has_approximate_index());
+            let stats = collection.index_stats();
+            assert_eq!(stats.mapped_points, 2);
+            assert_eq!(stats.owned_points, 0);
+            assert_eq!(stats.owned_vector_bytes, 0);
             assert_eq!(fs::metadata(directory.join("write.wal")).unwrap().len(), 0);
         }
 
@@ -1147,11 +1565,240 @@ mod tests {
         assert_eq!(collection.latest_sequence(), 1);
         assert_eq!(collection.collection().len(), 2);
         assert!(collection.has_approximate_index());
+        assert_eq!(collection.index_stats().mapped_points, 2);
         let hits = collection
             .search_with_ef(vec![1.0, 0.0], 2, None, 16)
             .unwrap();
         assert_eq!(hits[0].id, "a");
         assert!(directory.join("segment-00000000000000000001.fvs").exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn routine_flush_writes_only_changed_points() {
+        let directory = test_directory("small-delta-segment");
+        let mut collection =
+            PersistentCollection::open(&directory, config(), Durability::Sync).unwrap();
+        collection
+            .upsert(
+                (0..100)
+                    .map(|index| point(&format!("p{index:03}"), [1.0, 0.0]))
+                    .collect(),
+            )
+            .unwrap();
+        collection.flush().unwrap();
+        let full_size = fs::metadata(directory.join("segment-00000000000000000001.fvs"))
+            .unwrap()
+            .len();
+
+        collection.upsert(vec![point("p050", [0.0, 1.0])]).unwrap();
+        collection.flush().unwrap();
+        let delta_size = fs::metadata(directory.join("segment-00000000000000000002.fvs"))
+            .unwrap()
+            .len();
+        assert!(
+            delta_size * 4 < full_size,
+            "delta={delta_size} full={full_size}"
+        );
+        let stats = collection.index_stats();
+        assert_eq!(stats.mapped_points, 100);
+        assert_eq!(stats.owned_points, 0);
+        assert_eq!(stats.owned_vector_bytes, 0);
+        drop(collection);
+
+        let reopened = PersistentCollection::open(&directory, config(), Durability::Sync).unwrap();
+        assert_eq!(reopened.index_stats().mapped_points, 100);
+        assert_eq!(
+            reopened.collection().get("p050").unwrap().vector.as_slice(),
+            &[0.0, 1.0]
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn backup_copies_a_complete_base_and_delta_chain() {
+        let directory = test_directory("delta-backup-source");
+        let backup = test_directory("delta-backup-destination");
+        {
+            let mut collection =
+                PersistentCollection::open(&directory, config(), Durability::Sync).unwrap();
+            collection.upsert(vec![point("a", [1.0, 0.0])]).unwrap();
+            collection.flush().unwrap();
+            collection.upsert(vec![point("a", [0.0, 1.0])]).unwrap();
+            collection.upsert(vec![point("b", [1.0, 0.0])]).unwrap();
+            collection.flush().unwrap();
+            collection.copy_backup_to(&backup).unwrap();
+        }
+
+        let restored = PersistentCollection::open(&backup, config(), Durability::Sync).unwrap();
+        assert_eq!(restored.latest_sequence(), 3);
+        assert_eq!(restored.collection().len(), 2);
+        assert_eq!(
+            restored.collection().get("a").unwrap().vector.as_slice(),
+            &[0.0, 1.0]
+        );
+        assert_eq!(restored.index_stats().mapped_points, 2);
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_dir_all(backup).unwrap();
+    }
+
+    #[test]
+    fn legacy_single_segment_manifest_remains_readable() {
+        let directory = test_directory("legacy-manifest");
+        let sequence;
+        let segment_name;
+        {
+            let mut collection =
+                PersistentCollection::open(&directory, config(), Durability::Sync).unwrap();
+            collection.upsert(vec![point("a", [1.0, 0.0])]).unwrap();
+            sequence = collection.flush().unwrap();
+            segment_name = read_manifest(&directory).unwrap().unwrap().segments[0].clone();
+        }
+
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(MANIFEST_MAGIC);
+        legacy.push(FORMAT_VERSION);
+        legacy.extend_from_slice(&sequence.to_le_bytes());
+        put_string(&mut legacy, &segment_name).unwrap();
+        let checksum = crc32c(&legacy);
+        legacy.extend_from_slice(&checksum.to_le_bytes());
+        fs::write(directory.join("MANIFEST"), legacy).unwrap();
+
+        let collection =
+            PersistentCollection::open(&directory, config(), Durability::Sync).unwrap();
+        assert_eq!(collection.latest_sequence(), sequence);
+        assert!(collection.collection().get("a").is_some());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn legacy_v2_full_segment_remains_readable() {
+        let directory = test_directory("legacy-v2-segment");
+        {
+            drop(PersistentCollection::open(&directory, config(), Durability::Sync).unwrap());
+        }
+        let point = StoredPoint {
+            id: "legacy".into(),
+            vector: vec![1.0, 0.0].into(),
+            metadata: BTreeMap::new(),
+            sequence: 1,
+            public_view: OnceLock::new(),
+        };
+        let index = HnswIndex::build_quantized_prepared(
+            2,
+            Metric::Cosine,
+            HnswConfig::default(),
+            [(point.id.clone(), point.vector.as_slice())],
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(SEGMENT_MAGIC);
+        bytes.push(LEGACY_SEGMENT_VERSION);
+        bytes.push(metric_tag(Metric::Cosine));
+        bytes.extend_from_slice(&2_u64.to_le_bytes());
+        bytes.extend_from_slice(&1_u64.to_le_bytes());
+        put_count(&mut bytes, 1).unwrap();
+        put_string(&mut bytes, &point.id).unwrap();
+        bytes.extend_from_slice(&point.sequence.to_le_bytes());
+        for value in &point.vector {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        put_count(&mut bytes, 0).unwrap();
+        let graph = index.encode().unwrap();
+        put_count(&mut bytes, graph.len()).unwrap();
+        bytes.extend_from_slice(&graph);
+        let checksum = crc32c(&bytes);
+        bytes.extend_from_slice(&checksum.to_le_bytes());
+        let segment_name = "segment-00000000000000000001.fvs";
+        fs::write(directory.join(segment_name), bytes).unwrap();
+
+        let mut manifest = Vec::new();
+        manifest.extend_from_slice(MANIFEST_MAGIC);
+        manifest.push(FORMAT_VERSION);
+        manifest.extend_from_slice(&1_u64.to_le_bytes());
+        put_string(&mut manifest, segment_name).unwrap();
+        let checksum = crc32c(&manifest);
+        manifest.extend_from_slice(&checksum.to_le_bytes());
+        fs::write(directory.join("MANIFEST"), manifest).unwrap();
+
+        let collection =
+            PersistentCollection::open(&directory, config(), Durability::Sync).unwrap();
+        let legacy = collection.collection().get("legacy").unwrap();
+        assert_eq!(legacy.vector.as_slice(), &[1.0, 0.0]);
+        assert!(
+            !collection
+                .collection()
+                .get_stored("legacy")
+                .unwrap()
+                .vector
+                .is_memory_mapped()
+        );
+        assert!(collection.indexes[0].index.vectors_are_memory_mapped());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn flush_persists_a_quantized_graph() {
+        let directory = test_directory("quantized-segment");
+        {
+            let mut collection =
+                PersistentCollection::open(&directory, config(), Durability::Sync).unwrap();
+            collection
+                .upsert(vec![point("a", [1.0, 0.0]), point("b", [0.0, 1.0])])
+                .unwrap();
+            collection.flush().unwrap();
+            assert_eq!(
+                collection.indexes.last().unwrap().index.vector_storage(),
+                HnswVectorStorage::ScalarInt8
+            );
+        }
+        let collection =
+            PersistentCollection::open(&directory, config(), Durability::Sync).unwrap();
+        assert_eq!(
+            collection.indexes.last().unwrap().index.vector_storage(),
+            HnswVectorStorage::ScalarInt8
+        );
+        assert!(
+            collection
+                .indexes
+                .last()
+                .unwrap()
+                .index
+                .vectors_are_memory_mapped()
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn quantized_candidates_are_reranked_with_full_precision() {
+        let directory = test_directory("quantized-rerank");
+        let dot_config = CollectionConfig {
+            dimension: 4,
+            metric: Metric::DotProduct,
+        };
+        let mut collection =
+            PersistentCollection::open(&directory, dot_config, Durability::Sync).unwrap();
+        collection
+            .upsert(vec![
+                UpsertPoint {
+                    id: "a-worse".into(),
+                    vector: vec![0.0, 1.0, 0.5, 0.0],
+                    metadata: BTreeMap::new(),
+                },
+                UpsertPoint {
+                    id: "z-better".into(),
+                    vector: vec![0.0, 1.0, 0.503, 0.0],
+                    metadata: BTreeMap::new(),
+                },
+            ])
+            .unwrap();
+        collection.flush().unwrap();
+
+        let hits = collection
+            .search_with_ef(vec![0.0, 0.0, 1.0, 0.0], 1, None, 8)
+            .unwrap();
+        assert_eq!(hits[0].id, "z-better");
+        assert_eq!(hits[0].score, 0.503);
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1189,24 +1836,87 @@ mod tests {
     }
 
     #[test]
-    fn repeated_flush_replaces_obsolete_segment() {
-        let directory = test_directory("segment-replace");
+    fn repeated_flush_compacts_immutable_segments() {
+        let directory = test_directory("segment-compact");
         let first_segment = directory.join("segment-00000000000000000001.fvs");
-        let second_segment = directory.join("segment-00000000000000000002.fvs");
+        let compacted_segment = directory.join("segment-00000000000000000009.fvs");
         {
             let mut collection =
                 PersistentCollection::open(&directory, config(), Durability::Sync).unwrap();
             collection.upsert(vec![point("a", [1.0, 0.0])]).unwrap();
             collection.flush().unwrap();
-            collection.upsert(vec![point("b", [0.0, 1.0])]).unwrap();
-            collection.flush().unwrap();
+            for sequence in 2..=9 {
+                collection
+                    .upsert(vec![point(&format!("p{sequence}"), [0.0, 1.0])])
+                    .unwrap();
+                collection.flush().unwrap();
+            }
+            assert_eq!(collection.indexes.len(), 1);
         }
 
         assert!(!first_segment.exists());
-        assert!(second_segment.exists());
+        assert!(compacted_segment.exists());
         let collection =
             PersistentCollection::open(&directory, config(), Durability::Sync).unwrap();
-        assert_eq!(collection.collection().len(), 2);
+        assert_eq!(collection.collection().len(), 9);
+        assert_eq!(collection.indexes.len(), 1);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn immutable_deltas_suppress_stale_updates_and_tombstones_after_restart() {
+        let directory = test_directory("segment-deltas");
+        {
+            let mut collection =
+                PersistentCollection::open(&directory, config(), Durability::Sync).unwrap();
+            collection
+                .upsert(vec![
+                    point("updated", [1.0, 0.0]),
+                    point("deleted", [1.0, 0.0]),
+                ])
+                .unwrap();
+            collection.flush().unwrap();
+            collection
+                .upsert(vec![point("updated", [0.0, 1.0])])
+                .unwrap();
+            collection.delete(vec!["deleted".into()]).unwrap();
+            collection.flush().unwrap();
+            assert_eq!(collection.indexes.len(), 2);
+        }
+
+        let collection =
+            PersistentCollection::open(&directory, config(), Durability::Sync).unwrap();
+        assert_eq!(collection.indexes.len(), 2);
+        let hits = collection.search(vec![1.0, 0.0], 10, None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "updated");
+        assert!(hits[0].score.abs() < 1e-6);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn streaming_checksum_matches_chunked_writes() {
+        let bytes: Vec<u8> = (0..=255).cycle().take(65_537).collect();
+        let mut output = Crc32cWriter::new(Vec::new());
+        for chunk in bytes.chunks(37) {
+            output.write_all(chunk).unwrap();
+        }
+        let (written, checksum) = output.finish();
+        assert_eq!(written, bytes);
+        assert_eq!(checksum, crc32c(&bytes));
+    }
+
+    #[test]
+    fn abandoned_prepared_flush_removes_its_temporary_segment() {
+        let directory = test_directory("prepared-cleanup");
+        let mut collection =
+            PersistentCollection::open(&directory, config(), Durability::Sync).unwrap();
+        collection.upsert(vec![point("a", [1.0, 0.0])]).unwrap();
+        let prepared = PersistentCollection::build_flush(collection.flush_snapshot()).unwrap();
+        let temporary = prepared.temporary_segment.clone();
+        assert!(temporary.exists());
+        drop(prepared);
+        assert!(!temporary.exists());
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1352,6 +2062,36 @@ mod tests {
         assert_eq!(reopened.latest_sequence(), 2);
         assert!(reopened.collection().get("a").is_some());
         assert!(reopened.collection().get("b").is_some());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn old_flush_does_not_replace_a_newer_same_id_vector() {
+        let directory = test_directory("flush-same-id-race");
+        let mut collection =
+            PersistentCollection::open(&directory, config(), Durability::Sync).unwrap();
+        collection.upsert(vec![point("a", [1.0, 0.0])]).unwrap();
+        let snapshot = collection.flush_snapshot();
+        collection.upsert(vec![point("a", [0.0, 1.0])]).unwrap();
+        let prepared = PersistentCollection::build_flush(snapshot).unwrap();
+        collection.publish_flush(prepared).unwrap();
+        let current = collection.collection().get("a").unwrap();
+        assert_eq!(current.vector.as_slice(), &[0.0, 1.0]);
+        assert!(
+            !collection
+                .collection()
+                .get_stored("a")
+                .unwrap()
+                .vector
+                .is_memory_mapped()
+        );
+        drop(collection);
+
+        let reopened = PersistentCollection::open(&directory, config(), Durability::Sync).unwrap();
+        assert_eq!(
+            reopened.collection().get("a").unwrap().vector.as_slice(),
+            &[0.0, 1.0]
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 

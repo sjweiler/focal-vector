@@ -16,8 +16,8 @@ use tokio::sync::Mutex;
 use crate::metadata_index::MetadataIndex;
 use crate::raft_storage::{FocalRaftConfig, NodeId, ShardCommand, ShardResponse};
 use crate::{
-    Collection, CollectionConfig, Error, Filter, HnswConfig, HnswIndex, Result as FocalResult,
-    SearchHit,
+    Collection, CollectionConfig, Error, Filter, HnswConfig, HnswIndex, HnswVectorStorage,
+    Result as FocalResult, SearchHit,
 };
 
 const STATE_MAGIC: &[u8; 4] = b"FVRS";
@@ -235,15 +235,24 @@ impl DurableShardStateMachine {
             }
             filtered_candidates = Some(candidates);
         }
+        let rerank_k = if index.vector_storage() == HnswVectorStorage::ScalarInt8 {
+            k.saturating_mul(4)
+        } else {
+            k
+        };
         let mut graph_k = if filter.is_some() {
             ef_search
-                .max(k.saturating_mul(8))
+                .max(rerank_k.saturating_mul(8))
                 .saturating_add(inner.dirty_ids.len())
                 .min(index.len())
         } else {
-            k.saturating_add(inner.dirty_ids.len()).min(index.len())
+            rerank_k
+                .saturating_add(inner.dirty_ids.len())
+                .min(index.len())
         };
         let mut hits = Vec::with_capacity(graph_k.saturating_add(k));
+        let metric = inner.collection.config().metric;
+        let prepared_query = metric.prepare(query.clone())?;
         while graph_k > 0 {
             hits.clear();
             for hit in index.search(query.clone(), graph_k, ef_search.max(graph_k))? {
@@ -251,7 +260,7 @@ impl DurableShardStateMachine {
                     continue;
                 }
                 if let Some(filter) = &filter {
-                    let Some(point) = inner.collection.get(&hit.id) else {
+                    let Some(point) = inner.collection.get_stored(&hit.id) else {
                         return Err(Error::CorruptStorage(format!(
                             "HNSW point {} is missing from the Raft state machine",
                             hit.id
@@ -261,7 +270,7 @@ impl DurableShardStateMachine {
                         continue;
                     }
                 }
-                let point = inner.collection.get(&hit.id).ok_or_else(|| {
+                let point = inner.collection.get_stored(&hit.id).ok_or_else(|| {
                     Error::CorruptStorage(format!(
                         "HNSW point {} is missing from the Raft state machine",
                         hit.id
@@ -269,7 +278,7 @@ impl DurableShardStateMachine {
                 })?;
                 hits.push(SearchHit {
                     id: hit.id,
-                    score: hit.score,
+                    score: metric.score(&prepared_query, &point.vector),
                     metadata: point.metadata.clone(),
                     sequence: point.sequence,
                 });
@@ -626,7 +635,7 @@ fn build_indexes(
     config: CollectionConfig,
     points: &[crate::Point],
 ) -> FocalResult<(HnswIndex, MetadataIndex)> {
-    let index = HnswIndex::build(
+    let index = HnswIndex::build_quantized_prepared(
         config.dimension,
         config.metric,
         HnswConfig {
@@ -635,7 +644,7 @@ fn build_indexes(
         },
         points
             .iter()
-            .map(|point| (point.id.clone(), point.vector.clone())),
+            .map(|point| (point.id.clone(), point.vector.as_slice())),
     )?;
     Ok((index, MetadataIndex::build(points)))
 }

@@ -1,8 +1,36 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Bound;
+#[cfg(test)]
+use std::sync::OnceLock;
 
+use crate::collection::StoredPoint;
 use crate::{Filter, Point, Value};
+
+pub(crate) trait MetadataRecord {
+    fn id(&self) -> &str;
+    fn metadata(&self) -> &BTreeMap<String, Value>;
+}
+
+impl MetadataRecord for Point {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn metadata(&self) -> &BTreeMap<String, Value> {
+        &self.metadata
+    }
+}
+
+impl MetadataRecord for StoredPoint {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn metadata(&self) -> &BTreeMap<String, Value> {
+        &self.metadata
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct MetadataIndex {
@@ -12,15 +40,17 @@ pub(crate) struct MetadataIndex {
 }
 
 impl MetadataIndex {
-    pub(crate) fn build<'a>(points: impl IntoIterator<Item = &'a Point>) -> Self {
+    pub(crate) fn build<'a, P: MetadataRecord + 'a>(
+        points: impl IntoIterator<Item = &'a P>,
+    ) -> Self {
         let mut index = Self {
             all_ids: HashSet::new(),
             equality: HashMap::new(),
             numeric: HashMap::new(),
         };
         for point in points {
-            index.all_ids.insert(point.id.clone());
-            for (field, value) in &point.metadata {
+            index.all_ids.insert(point.id().to_owned());
+            for (field, value) in point.metadata() {
                 if let Some(key) = ScalarKey::from_value(value) {
                     index
                         .equality
@@ -28,7 +58,7 @@ impl MetadataIndex {
                         .or_default()
                         .entry(key)
                         .or_default()
-                        .insert(point.id.clone());
+                        .insert(point.id().to_owned());
                 }
                 if let Some(value) = numeric_value(value) {
                     index
@@ -37,7 +67,7 @@ impl MetadataIndex {
                         .or_default()
                         .entry(OrderedF64::new(value))
                         .or_default()
-                        .insert(point.id.clone());
+                        .insert(point.id().to_owned());
                 }
             }
         }
@@ -168,16 +198,17 @@ fn numeric_value(value: &Value) -> Option<f64> {
 mod tests {
     use super::*;
 
-    fn point(id: &str, tenant: &str, price: i64, enabled: bool) -> Point {
-        Point {
+    fn point(id: &str, tenant: &str, price: i64, enabled: bool) -> StoredPoint {
+        StoredPoint {
             id: id.into(),
-            vector: vec![1.0],
+            vector: vec![1.0].into(),
             metadata: BTreeMap::from([
                 ("tenant".into(), Value::Keyword(tenant.into())),
                 ("price".into(), Value::Integer(price)),
                 ("enabled".into(), Value::Boolean(enabled)),
             ]),
             sequence: 1,
+            public_view: OnceLock::new(),
         }
     }
 

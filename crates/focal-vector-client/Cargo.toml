@@ -1,0 +1,10 @@
+[package]
+name = "focal-vector-client"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Lightweight Unix-socket client for the Focal Vector daemon"
+
+[dependencies]
+focal-vector-protocol = { path = "../focal-vector-protocol" }
+serde_json = "1.0"
