@@ -140,8 +140,10 @@ The Rust HNSW implementation owns its graph representation and uses deterministi
 level selection and tie-breaking, making builds reproducible. The graph is
 versioned and persisted inside the checksummed immutable segment. Unfiltered
 queries merge graph candidates with exact results from IDs changed since the
-last flush, preserving ANN performance during incremental writes. Filter-aware
-traversal is the next integration step.
+last flush, preserving ANN performance during incremental writes. Replicated
+shards adaptively expand HNSW traversal for broad filters and fall back to exact
+metadata candidates when selectivity or graph recall requires it; the
+single-node persistent path keeps filtered reads exact.
 
 The mutable memtable uses exact search until it is large enough to justify a
 temporary HNSW index. A background builder may rebuild that graph in batches;

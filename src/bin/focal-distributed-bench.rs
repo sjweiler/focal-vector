@@ -1,8 +1,11 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use focal_vector::{DistributedCollection, ReplicaSet, UpsertPoint};
+use focal_vector::{
+    DistributedCollection, HttpClientTlsConfig, Metric, ReplicaSet, UpsertPoint, build_http_client,
+};
+use tokio::task::JoinSet;
 
 fn required(name: &str) -> Result<String, Box<dyn std::error::Error>> {
     env::var(name).map_err(|_| format!("{name} is required").into())
@@ -52,6 +55,78 @@ fn percentile(latencies: &[Duration], percentile: f64) -> Duration {
     latencies[index]
 }
 
+fn metric() -> Result<Metric, Box<dyn std::error::Error>> {
+    match env::var("FOCAL_METRIC")
+        .unwrap_or_else(|_| "cosine".into())
+        .as_str()
+    {
+        "cosine" => Ok(Metric::Cosine),
+        "dot" | "dot_product" => Ok(Metric::DotProduct),
+        "euclidean" => Ok(Metric::Euclidean),
+        value => Err(format!("unsupported FOCAL_METRIC: {value}").into()),
+    }
+}
+
+fn exact_ids(
+    query: &[f32],
+    point_count: usize,
+    dimension: usize,
+    k: usize,
+    metric: Metric,
+) -> HashSet<String> {
+    let query_norm = query.iter().map(|value| value * value).sum::<f32>().sqrt();
+    let mut scored: Vec<_> = (0..point_count)
+        .map(|index| {
+            let point = vector(index as u64 + 1, dimension);
+            let score = match metric {
+                Metric::DotProduct => query
+                    .iter()
+                    .zip(&point)
+                    .map(|(left, right)| left * right)
+                    .sum(),
+                Metric::Cosine => {
+                    let point_norm = point.iter().map(|value| value * value).sum::<f32>().sqrt();
+                    query
+                        .iter()
+                        .zip(&point)
+                        .map(|(left, right)| left * right)
+                        .sum::<f32>()
+                        / (query_norm * point_norm)
+                }
+                Metric::Euclidean => -query
+                    .iter()
+                    .zip(&point)
+                    .map(|(left, right)| {
+                        let difference = left - right;
+                        difference * difference
+                    })
+                    .sum::<f32>(),
+            };
+            (index, score)
+        })
+        .collect();
+    scored.sort_unstable_by(|(left_id, left), (right_id, right)| {
+        right.total_cmp(left).then_with(|| left_id.cmp(right_id))
+    });
+    scored
+        .into_iter()
+        .take(k)
+        .map(|(index, _)| format!("bench-{index:012}"))
+        .collect()
+}
+
+fn tls_config() -> Result<Option<HttpClientTlsConfig>, Box<dyn std::error::Error>> {
+    let ca_certificate = env::var("FOCAL_TLS_CA").ok().map(Into::into);
+    let identity_pem = env::var("FOCAL_TLS_CLIENT_IDENTITY").ok().map(Into::into);
+    if ca_certificate.is_none() && identity_pem.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(HttpClientTlsConfig {
+        ca_certificate,
+        identity_pem,
+    }))
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shards = replica_sets(&required("FOCAL_SHARDS")?)?;
@@ -60,12 +135,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let point_count = number("FOCAL_BENCH_POINTS", 10_000)?;
     let query_count = number("FOCAL_BENCH_QUERIES", 100)?;
     let k = number("FOCAL_BENCH_K", 10)?;
-    let ef_search = number("FOCAL_BENCH_EF_SEARCH", k.saturating_mul(4).max(96))?;
-    if dimension == 0 || point_count == 0 || query_count == 0 || k == 0 || ef_search < k {
+    let ef_search = number("FOCAL_BENCH_EF_SEARCH", k.saturating_mul(16).max(256))?;
+    let concurrency = number("FOCAL_BENCH_CONCURRENCY", 1)?;
+    let recall_queries = number("FOCAL_BENCH_RECALL_QUERIES", query_count.min(10))?;
+    let metric = metric()?;
+    if dimension == 0
+        || point_count == 0
+        || query_count == 0
+        || k == 0
+        || ef_search < k
+        || concurrency == 0
+        || recall_queries > query_count
+    {
         return Err("benchmark dimensions and counts must be positive".into());
     }
 
-    let collection = DistributedCollection::new(shards, token)?;
+    let collection = DistributedCollection::with_http_client(
+        shards,
+        token,
+        build_http_client(tls_config()?.as_ref())?,
+    )?;
     let points: Vec<_> = (0..point_count)
         .map(|index| UpsertPoint {
             id: format!("bench-{index:012}"),
@@ -81,27 +170,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ingest_elapsed = ingest_start.elapsed();
 
     let mut latencies = Vec::with_capacity(query_count);
+    let mut query_results = Vec::with_capacity(query_count);
     let query_start = Instant::now();
-    for index in 0..query_count {
-        let query = vector(point_count as u64 + index as u64 + 1, dimension);
-        let started = Instant::now();
-        let hits = collection.search_with_ef(query, k, None, ef_search).await?;
-        if hits.is_empty() {
-            return Err("query unexpectedly returned no results".into());
+    let mut tasks = JoinSet::new();
+    let mut next_query = 0;
+    while next_query < query_count || !tasks.is_empty() {
+        while next_query < query_count && tasks.len() < concurrency {
+            let index = next_query;
+            next_query += 1;
+            let collection = collection.clone();
+            let query = vector(point_count as u64 + index as u64 + 1, dimension);
+            tasks.spawn(async move {
+                let started = Instant::now();
+                let result = collection
+                    .search_result_with_ef(query, k, None, ef_search, false)
+                    .await?;
+                Ok::<_, focal_vector::Error>((index, started.elapsed(), result))
+            });
         }
-        latencies.push(started.elapsed());
+        if let Some(result) = tasks.join_next().await {
+            let (index, latency, result) = result??;
+            if result.hits.is_empty() {
+                return Err("query unexpectedly returned no results".into());
+            }
+            latencies.push(latency);
+            query_results.push((index, result));
+        }
     }
     let query_elapsed = query_start.elapsed();
     latencies.sort_unstable();
 
     println!("shards={}", collection.shard_count());
     println!(
-        "points={point_count} dimension={dimension} queries={query_count} k={k} ef_search={ef_search}"
+        "points={point_count} dimension={dimension} queries={query_count} k={k} ef_search={ef_search} concurrency={concurrency}"
     );
     println!(
         "ingest_seconds={:.3} ingest_vectors_per_second={:.1}",
         ingest_elapsed.as_secs_f64(),
         point_count as f64 / ingest_elapsed.as_secs_f64()
+    );
+    let mut recalled = 0_usize;
+    for (index, result) in query_results
+        .iter()
+        .filter(|(index, _)| *index < recall_queries)
+    {
+        let query = vector(point_count as u64 + *index as u64 + 1, dimension);
+        let exact = exact_ids(&query, point_count, dimension, k, metric);
+        recalled += result
+            .hits
+            .iter()
+            .filter(|hit| exact.contains(&hit.id))
+            .count();
+    }
+    let recall = if recall_queries == 0 {
+        0.0
+    } else {
+        recalled as f64 / (recall_queries * k) as f64
+    };
+    let min_applied_index = query_results
+        .iter()
+        .filter_map(|(_, result)| result.min_applied_index)
+        .min();
+    println!(
+        "recall_at_{k}={recall:.4} recall_queries={recall_queries} min_applied_index={}",
+        min_applied_index.map_or_else(|| "unknown".into(), |index| index.to_string())
     );
     println!(
         "query_qps={:.1} p50_ms={:.3} p95_ms={:.3} p99_ms={:.3}",

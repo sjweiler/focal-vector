@@ -3,8 +3,9 @@
 Focal Vector's implemented `ShardedCollection` is the data-partitioning layer.
 The OpenRaft integration has durable checksummed journals for votes, committed
 indexes, log entries, truncation, purging, applied vector commands, and request
-deduplication. Authenticated HTTP transports election, append, and snapshot
-RPCs. Cluster bootstrap, learner addition, joint-consensus membership changes,
+deduplication. Authenticated HTTP or native TLS/mTLS transports election,
+append, and snapshot RPCs. Cluster bootstrap, learner addition,
+joint-consensus membership changes,
 linearizable reads, majority writes, snapshot installation, and leader failover
 are implemented for a replicated shard.
 
@@ -35,7 +36,8 @@ and merges shard-local results into a deterministic global top-k.
   ID delta; `ef_search` controls the recall/latency tradeoff.
 - Graph rebuilds occur after a bulk load or when the changed delta reaches 20%
   of the live collection (with a 256-ID minimum).
-- Metadata-filtered reads remain exact to preserve filter correctness.
+- Selective metadata filters use exact indexed candidates. Broad filters
+  adaptively expand HNSW traversal and fall back to exact candidates if needed.
 - Explicit stale reads may query followers at a reported applied index.
 - The coordinator requests top-k from every shard, merges by descending score
   and ascending point ID, and reports the minimum applied index.
@@ -58,5 +60,6 @@ and merges shard-local results into a deterministic global top-k.
 - Restart every voter and verify persisted membership re-elects a leader, all
   replicas catch up, and another write commits. (Implemented.)
 - Corrupt or truncate logs and snapshots and require fail-closed startup.
+  (Implemented.)
 - Add and remove voters through joint consensus, then commit under the new voter
   set. (Implemented.)

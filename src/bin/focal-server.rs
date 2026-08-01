@@ -1,8 +1,9 @@
 use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
-use focal_vector::{Database, DatabaseConfig, ServerConfig, router};
+use focal_vector::{Database, DatabaseConfig, ServerConfig, load_server_tls, router};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -23,11 +24,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let database = Arc::new(Database::open(data_directory, DatabaseConfig::default())?);
     let application = router(database, server_config)?;
-    let listener = tokio::net::TcpListener::bind(address).await?;
-    println!("focal-vector listening on http://{address}");
-    axum::serve(listener, application)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    let certificate = env::var("FOCAL_TLS_CERT").ok();
+    let private_key = env::var("FOCAL_TLS_KEY").ok();
+    match (certificate, private_key) {
+        (Some(certificate), Some(private_key)) => {
+            let client_ca = env::var("FOCAL_TLS_CLIENT_CA").ok();
+            let tls = load_server_tls(
+                certificate,
+                private_key,
+                client_ca.as_deref().map(std::path::Path::new),
+            )?;
+            let handle = axum_server::Handle::new();
+            let shutdown_handle = handle.clone();
+            tokio::spawn(async move {
+                shutdown_signal().await;
+                shutdown_handle.graceful_shutdown(Some(Duration::from_secs(30)));
+            });
+            println!("focal-vector listening on https://{address}");
+            axum_server::bind_rustls(address, tls)
+                .handle(handle)
+                .serve(application.into_make_service())
+                .await?;
+        }
+        (None, None) => {
+            let listener = tokio::net::TcpListener::bind(address).await?;
+            println!("focal-vector listening on http://{address}");
+            axum::serve(listener, application)
+                .with_graceful_shutdown(shutdown_signal())
+                .await?;
+        }
+        _ => return Err("FOCAL_TLS_CERT and FOCAL_TLS_KEY must be set together".into()),
+    }
     Ok(())
 }
 
