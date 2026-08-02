@@ -9,10 +9,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use memmap2::MmapOptions;
 
 use crate::collection::{PointVector, StoredPoint};
+#[cfg(feature = "cuda")]
+use crate::cuda::CudaIndex;
 use crate::metadata_index::MetadataIndex;
 use crate::{
-    Collection, CollectionConfig, Error, Filter, HnswConfig, HnswIndex, HnswVectorStorage, Metric,
-    Result, SearchHit, UpsertPoint, Value,
+    Collection, CollectionConfig, CudaSearchConfig, CudaSearchMode, Error, Filter, HnswConfig,
+    HnswIndex, HnswVectorStorage, Metric, Result, SearchHit, UpsertPoint, Value,
 };
 
 const META_MAGIC: &[u8; 4] = b"FVMT";
@@ -48,6 +50,7 @@ pub struct PersistentIndexStats {
     pub mapped_points: usize,
     pub owned_points: usize,
     pub owned_vector_bytes: usize,
+    pub cuda_vectors: usize,
 }
 
 #[derive(Debug)]
@@ -60,6 +63,9 @@ pub struct PersistentCollection {
     indexes: Vec<IndexSegment>,
     metadata_index: Option<MetadataIndex>,
     dirty_ids: HashSet<String>,
+    cuda_config: CudaSearchConfig,
+    #[cfg(feature = "cuda")]
+    cuda_index: Option<CudaIndex>,
 }
 
 pub(crate) struct FlushSnapshot {
@@ -112,6 +118,15 @@ impl PersistentCollection {
         config: CollectionConfig,
         durability: Durability,
     ) -> Result<Self> {
+        Self::open_with_cuda(directory, config, durability, CudaSearchConfig::from_env()?)
+    }
+
+    pub fn open_with_cuda(
+        directory: impl AsRef<Path>,
+        config: CollectionConfig,
+        durability: Durability,
+        cuda_config: CudaSearchConfig,
+    ) -> Result<Self> {
         let directory = directory.as_ref().to_path_buf();
         fs::create_dir_all(&directory)?;
         let lock = OpenOptions::new()
@@ -146,6 +161,16 @@ impl PersistentCollection {
         recover(&mut wal, &mut inner, &mut dirty_ids)?;
         wal.seek(SeekFrom::End(0))?;
 
+        #[cfg(feature = "cuda")]
+        let cuda_index = create_cuda_index(&inner, cuda_config)?;
+        #[cfg(not(feature = "cuda"))]
+        if cuda_config.mode == CudaSearchMode::Required {
+            return Err(Error::InvalidConfiguration(
+                "CUDA search was requested, but focal-vector was built without --features cuda"
+                    .into(),
+            ));
+        }
+
         Ok(Self {
             _lock: lock,
             inner,
@@ -155,6 +180,9 @@ impl PersistentCollection {
             indexes,
             metadata_index,
             dirty_ids,
+            cuda_config,
+            #[cfg(feature = "cuda")]
+            cuda_index,
         })
     }
 
@@ -241,6 +269,15 @@ impl PersistentCollection {
         if ef_search < k {
             return Err(Error::InvalidQuery("ef_search must be at least k"));
         }
+        if k == 0 {
+            return Err(Error::InvalidQuery("k must be greater than zero"));
+        }
+        if query.len() != self.inner.config().dimension {
+            return Err(Error::InvalidDimension {
+                expected: self.inner.config().dimension,
+                actual: query.len(),
+            });
+        }
         if let Some(filter) = filter {
             let Some(metadata_index) = &self.metadata_index else {
                 return self.inner.search(query, k, Some(filter));
@@ -254,6 +291,26 @@ impl PersistentCollection {
                 self.inner
                     .search_ids(query, k, &self.dirty_ids, Some(filter))?,
             );
+            return Ok(merge_hits(hits, k));
+        }
+
+        #[cfg(feature = "cuda")]
+        if let Some(cuda_index) = &self.cuda_index {
+            let metric = self.inner.config().metric;
+            let prepared_query = metric.prepare(query.clone())?;
+            let mut hits = Vec::with_capacity(k.saturating_mul(2));
+            for hit in cuda_index.search(&prepared_query, k, &self.dirty_ids)? {
+                let Some(point) = self.inner.get_stored(&hit.id) else {
+                    continue;
+                };
+                hits.push(SearchHit {
+                    id: hit.id,
+                    score: metric.score(&prepared_query, &point.vector),
+                    metadata: point.metadata.clone(),
+                    sequence: point.sequence,
+                });
+            }
+            hits.extend(self.inner.search_ids(query, k, &self.dirty_ids, None)?);
             return Ok(merge_hits(hits, k));
         }
 
@@ -299,12 +356,31 @@ impl PersistentCollection {
         !self.indexes.is_empty()
     }
 
+    pub fn has_cuda_index(&self) -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            self.cuda_index.is_some()
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            false
+        }
+    }
+
+    pub fn cuda_search_config(&self) -> CudaSearchConfig {
+        self.cuda_config
+    }
+
     pub fn pending_point_count(&self) -> usize {
         self.dirty_ids.len()
     }
 
     pub fn index_stats(&self) -> PersistentIndexStats {
         let (mapped_points, owned_points, owned_vector_bytes) = self.inner.vector_storage_stats();
+        #[cfg(feature = "cuda")]
+        let cuda_vectors = self.cuda_index.as_ref().map_or(0, CudaIndex::len);
+        #[cfg(not(feature = "cuda"))]
+        let cuda_vectors = 0;
         self.indexes.iter().fold(
             PersistentIndexStats {
                 segments: self.indexes.len(),
@@ -316,6 +392,7 @@ impl PersistentCollection {
                 mapped_points,
                 owned_points,
                 owned_vector_bytes,
+                cuda_vectors,
             },
             |mut total, segment| {
                 let stats = segment.index.stats();
@@ -483,6 +560,14 @@ impl PersistentCollection {
             });
         }
         self.metadata_index = prepared.metadata_index.take();
+        #[cfg(feature = "cuda")]
+        {
+            // CUDA is a rebuildable cache. A refresh failure disables it and
+            // leaves the durable CPU/HNSW engine available.
+            self.cuda_index = create_cuda_index(&self.inner, self.cuda_config)
+                .ok()
+                .flatten();
+        }
         Ok(sequence)
     }
 
@@ -509,6 +594,34 @@ impl PersistentCollection {
             return Err(error.into());
         }
         Ok(())
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn create_cuda_index(
+    collection: &Collection,
+    config: CudaSearchConfig,
+) -> Result<Option<CudaIndex>> {
+    if config.mode == CudaSearchMode::Disabled {
+        return Ok(None);
+    }
+    if config.mode == CudaSearchMode::Preferred && collection.len() < config.min_vectors {
+        return Ok(None);
+    }
+    let points = collection.snapshot_stored_points();
+    if points.is_empty() {
+        return match config.mode {
+            CudaSearchMode::Required => {
+                CudaIndex::probe(config.device)?;
+                Ok(None)
+            }
+            CudaSearchMode::Disabled | CudaSearchMode::Preferred => Ok(None),
+        };
+    }
+    match CudaIndex::build(collection.config(), &points, config.device) {
+        Ok(index) => Ok(Some(index)),
+        Err(_error) if config.mode == CudaSearchMode::Preferred => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -1440,6 +1553,42 @@ mod tests {
             vector: vector.into(),
             metadata: BTreeMap::from([("kind".into(), Value::Keyword("test".into()))]),
         }
+    }
+
+    #[test]
+    fn preferred_cuda_leaves_small_collections_on_cpu() {
+        let directory = test_directory("cuda-small-fallback");
+        let cuda = CudaSearchConfig {
+            mode: CudaSearchMode::Preferred,
+            device: 0,
+            min_vectors: 10_000,
+        };
+        let collection =
+            PersistentCollection::open_with_cuda(&directory, config(), Durability::Sync, cuda)
+                .unwrap();
+        assert!(!collection.has_cuda_index());
+        assert_eq!(collection.cuda_search_config(), cuda);
+        drop(collection);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn required_cuda_rejects_a_non_cuda_build() {
+        let directory = test_directory("cuda-required-without-feature");
+        let error = PersistentCollection::open_with_cuda(
+            &directory,
+            config(),
+            Durability::Sync,
+            CudaSearchConfig {
+                mode: CudaSearchMode::Required,
+                device: 0,
+                min_vectors: 0,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::InvalidConfiguration(_)));
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

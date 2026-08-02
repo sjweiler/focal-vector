@@ -9,9 +9,14 @@ description = "A low-latency vector search engine"
 members = ["crates/focal-vector-client", "crates/focal-vector-protocol"]
 resolver = "2"
 
+[features]
+default = []
+cuda = ["dep:cudarc"]
+
 [dependencies]
 axum = "0.8.9"
 axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
+cudarc = { version = "0.19.8", optional = true, default-features = false, features = ["std", "driver", "cublas", "dynamic-loading", "cuda-12000"] }
 memmap2 = "0.9.11"
 openraft = { version = "=0.9.25", features = ["serde", "storage-v2"] }
 rayon = "1.11"

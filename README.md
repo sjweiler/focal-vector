@@ -169,11 +169,42 @@ construction time, and query latency on this AVX2 host. The portable fallback
 and other CPUs can have different construction tradeoffs, so both
 representations remain available to benchmark and library users.
 
-GPU indexing is not implemented in Focal Vector. At this scale, one million
-128-dimensional `f32` vectors occupy about 488 MiB, so deployments with a CUDA
-GPU should separately benchmark exact GPU search or a GPU-native graph index
-before committing to CPU HNSW. The CPU implementation remains useful when a GPU
-dependency is undesirable or the index must be served from ordinary hosts.
+### Optional CUDA exact search
+
+Focal Vector can keep an immutable full-precision vector snapshot on an NVIDIA
+GPU and use cuBLAS for exact unfiltered searches. CUDA remains both a Cargo
+feature and a runtime choice; ordinary builds have no CUDA dependency and retain
+the CPU/HNSW behavior.
+
+Build and enable automatic selection with:
+
+```bash
+cargo build --release --features cuda
+FOCAL_CUDA=auto target/release/focal-server
+```
+
+The packaged feature targets dynamically loaded CUDA 12 driver and cuBLAS
+libraries, so CUDA is not required on the build host.
+
+`FOCAL_CUDA=required` fails collection opening when device or cuBLAS
+initialization fails. `FOCAL_CUDA=off` is the default. Select a device with
+`FOCAL_CUDA_DEVICE=0` and change the automatic-selection threshold with
+`FOCAL_CUDA_MIN_VECTORS=10000`. Library users can instead call
+`PersistentCollection::open_with_cuda` or `SharedCollection::open_with_cuda`
+with `CudaSearchConfig`.
+
+The CUDA cache is rebuilt after a successful flush. Updates made since that
+snapshot remain on the exact CPU delta path, then both top-k lists are merged.
+Metadata-filtered searches continue to use the existing metadata index and CPU
+exact engine. CUDA failures while refreshing the rebuildable cache disable it
+without affecting the durable collection.
+
+The current implementation copies one score per snapshot vector back to the
+host for deterministic top-k selection and full-precision CPU reranking. This
+is a useful exact-search baseline; a device-side top-k reduction is the next
+optimization for very large collections. One million 128-dimensional `f32`
+vectors occupy about 488 MiB of VRAM before score and cuBLAS workspaces, so
+benchmark against scalar-int8 HNSW on the actual query workload.
 
 ## Operational readiness and limits
 

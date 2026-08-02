@@ -33,8 +33,10 @@ cross-collection transactions, and automatic distributed rebalancing.
    +------ active memtable ---+
    |             |
  immutable segments <--- flush / compaction workers
-   |       |      |
+   |       |      |             |
  vectors  HNSW   metadata indexes
+   |
+ optional CUDA exact-search cache
 ```
 
 The read path is shared-nothing across immutable segments. Each segment can be
@@ -162,6 +164,42 @@ queries must remain correct while it is absent.
 For memory-constrained collections, add scalar quantization first, keeping
 full-precision vectors on disk for reranking. Add product quantization or
 disk-oriented graphs only after profiling shows memory is the limiting factor.
+
+### Optional CUDA exact-search cache
+
+CUDA is an optional acceleration layer, not a storage format or correctness
+dependency. A feature-gated Rust backend uses dynamically loaded CUDA 12 and
+cuBLAS libraries, so ordinary builds do not link CUDA and CUDA-enabled binaries
+can still select CPU/HNSW at runtime.
+
+The device cache contains one dense row-major `f32` matrix for an immutable
+collection snapshot, an ordinal-to-point-ID table, and squared norms used by
+Euclidean scoring. Cosine vectors remain normalized by the ordinary ingestion
+path. A query upload followed by cuBLAS GEMV produces dot products for the
+snapshot; Rust converts Euclidean scores, performs deterministic score/ID top-k
+selection, and reranks returned candidates against authoritative full-precision
+vectors.
+
+CUDA search currently applies only to unfiltered persistent queries. Filtered
+queries retain the metadata-index and exact CPU plans. IDs changed after the
+device snapshot are excluded from GPU results, searched exactly in the dirty
+CPU delta, and merged with the GPU candidates. This gives updates and deletes
+the same visibility semantics as immutable HNSW segments.
+
+The cache is reconstructed from authoritative collection points when a
+collection opens and after a successful flush. It is never written into the
+manifest or segment files and can always be discarded. Preferred mode falls
+back to CPU/HNSW when the device is unavailable, the collection is below its
+configured vector threshold, or a cache refresh fails. Required mode makes
+initial device and cuBLAS initialization failure an open error. Runtime device
+errors are returned instead of silently replaying a query on a different
+engine.
+
+The initial implementation downloads one score per snapshot vector and selects
+top-k in Rust. A device-side top-k reduction and batched GEMM are future
+optimizations; both must preserve stable ID tie-breaking and full-precision API
+scores. GPU memory admission must account for the vector matrix, score buffers,
+cuBLAS workspaces, and concurrent queries rather than vector bytes alone.
 
 ## 6. Filtered search
 
@@ -303,6 +341,8 @@ Required metrics include:
 - WAL append/group-commit latency and bytes;
 - memtable and segment count/bytes;
 - HNSW build time and graph memory;
+- CUDA initialization/upload latency, resident vectors, score-transfer bytes,
+  device memory, and CPU/HNSW fallback count;
 - compaction debt, tombstone ratio, and read/write amplification;
 - cache hit rate, queue depth, rejected work, and page faults.
 
@@ -323,6 +363,8 @@ quietly reducing recall is a regression.
 - Corrupt and truncate WAL and segment files and verify explicit failure.
 - Run concurrent query/upsert/delete/compaction tests under race detection.
 - Verify stable results around NaN, infinity, zero norm, ties, and duplicate IDs.
+- Compare CUDA candidates and final scores with the exact CPU oracle for every
+  metric, including dirty updates, deletes, and deterministic ties.
 - Fuzz API decoders and on-disk readers with strict allocation limits.
 
 ## 14. Implementation choices
@@ -342,6 +384,7 @@ wal           record framing, group commit, recovery
 memtable      current versions and tombstones
 segment       immutable file formats and exact scan
 index-hnsw    build, load, and search
+index-cuda    optional device cache, cuBLAS scoring, deterministic top-k
 filter        schema, indexes, expressions, planner
 query         fan-out, reranking, version merge, top-k
 compaction    flush, merge, publish, garbage collection
@@ -367,8 +410,8 @@ snapshots, deletes, and fault-injection tests.
 
 ### Milestone 3: fast ANN
 
-HNSW build/search, full-precision reranking, recall/latency sweeps, bounded query
-execution, and index build metrics.
+HNSW build/search, optional CUDA exact search, full-precision reranking,
+recall/latency sweeps, bounded query execution, and index build metrics.
 
 ### Milestone 4: sustained operation
 

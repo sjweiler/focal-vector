@@ -5,6 +5,7 @@
 
 mod collection;
 mod concurrent;
+mod cuda;
 mod database;
 mod distributed;
 mod error;
@@ -23,6 +24,7 @@ mod tls;
 
 pub use collection::{Collection, CollectionConfig, Point, SearchHit, UpsertPoint};
 pub use concurrent::{BackgroundFlusher, SharedCollection};
+pub use cuda::{CudaSearchConfig, CudaSearchMode};
 pub use database::{CollectionSummary, Database, DatabaseConfig};
 pub use distributed::{DistributedCollection, DistributedSearchResult, ReplicaSet};
 pub use error::{Error, Result};

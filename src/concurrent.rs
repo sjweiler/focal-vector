@@ -3,8 +3,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::{
-    CollectionConfig, Durability, Error, Filter, PersistentCollection, Result, SearchHit,
-    UpsertPoint,
+    CollectionConfig, CudaSearchConfig, Durability, Error, Filter, PersistentCollection, Result,
+    SearchHit, UpsertPoint,
 };
 
 #[derive(Debug, Clone)]
@@ -20,6 +20,20 @@ impl SharedCollection {
     ) -> Result<Self> {
         Ok(Self::new(PersistentCollection::open(
             directory, config, durability,
+        )?))
+    }
+
+    pub fn open_with_cuda(
+        directory: impl AsRef<std::path::Path>,
+        config: CollectionConfig,
+        durability: Durability,
+        cuda_config: CudaSearchConfig,
+    ) -> Result<Self> {
+        Ok(Self::new(PersistentCollection::open_with_cuda(
+            directory,
+            config,
+            durability,
+            cuda_config,
         )?))
     }
 
@@ -84,6 +98,10 @@ impl SharedCollection {
 
     pub fn has_approximate_index(&self) -> Result<bool> {
         Ok(self.read()?.has_approximate_index())
+    }
+
+    pub fn has_cuda_index(&self) -> Result<bool> {
+        Ok(self.read()?.has_cuda_index())
     }
 
     pub fn backup_to(&self, destination: impl AsRef<std::path::Path>) -> Result<u64> {
